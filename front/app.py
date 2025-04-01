@@ -167,12 +167,10 @@ def dashboard_page():
                     st.rerun()
 
     # Available models with prices
+    models_response, error = make_request("GET", "/models", auth=(...))
     models_info = [
-        {"id": "risk_model", "name": "Risk Assessment Model", "price": 5, "description": "Basic risk prediction"},
-        {"id": "return_model", "name": "Return Prediction Model", "price": 10,
-         "description": "Standard return prediction"},
-        {"id": "premium_model", "name": "Premium Analysis Model", "price": 20,
-         "description": "Advanced analysis with recommendations"}
+        {"id": m["id"], "name": m["name"], "price": m["cost"], "description": m["description"]}
+        for m in models_response
     ]
 
     # Prediction section
