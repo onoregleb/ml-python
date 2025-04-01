@@ -4,9 +4,9 @@ import json
 from datetime import datetime
 
 # Config
-API_BASE_URL = "http://127.0.0.1:8000"  # Update if your API is hosted elsewhere
+API_BASE_URL = "http://127.0.0.1:8000"  # Какой порт слушаем
 
-# Initialize session state
+# Инициализация состояний сессии
 if 'logged_in' not in st.session_state:
     st.session_state.logged_in = False
 if 'page' not in st.session_state:
@@ -16,7 +16,7 @@ if 'user' not in st.session_state:
 if 'password' not in st.session_state:
     st.session_state.password = ""
 
-# Model prices (should match your backend)
+# Цены на модели
 MODEL_PRICES = {
     "risk_model": 5,
     "return_model": 10,
@@ -24,7 +24,7 @@ MODEL_PRICES = {
 }
 
 
-# Helper functions
+# Вспомогательная функция
 def make_request(method, endpoint, data=None, auth=None):
     url = f"{API_BASE_URL}{endpoint}"
     try:
@@ -56,7 +56,7 @@ def logout():
 
 
 def check_balance(required_amount):
-    """Check if user has enough balance"""
+    """Проверка на достаточность баланса"""
     if not st.session_state.user:
         return False
     return st.session_state.user['balance'] >= required_amount
@@ -131,13 +131,12 @@ def register_page():
 def dashboard_page():
     st.title("ML Service Dashboard")
 
-    # Check if user is properly authenticated
+    # Проверка успешности авторизации
     if not st.session_state.user or not st.session_state.password:
         st.error("Authentication error. Please login again.")
         logout()
         return
 
-    # User info header
     col1, col2 = st.columns([4, 1])
     with col1:
         st.write(f"Welcome, {st.session_state.user['firstname']}!")
@@ -146,7 +145,7 @@ def dashboard_page():
         if st.button("Logout"):
             logout()
 
-    # Top up balance
+    # Пополнение баланса
     with st.expander("💳 Top Up Balance", expanded=False):
         amount = st.number_input("Amount to add", min_value=1.0, step=1.0, value=10.0)
         if st.button("Top Up Now"):
@@ -166,7 +165,7 @@ def dashboard_page():
                     st.success("Balance topped up successfully!")
                     st.rerun()
 
-    # Available models with prices
+    # Получение доступных моделей
     models_response, error = make_request(
         "GET",
         "/models",
@@ -177,10 +176,9 @@ def dashboard_page():
         for m in models_response
     ]
 
-    # Prediction section
+    # Секция с предсказаниями
     st.header("📊 Make a Prediction")
     with st.form("prediction_form"):
-        # Model selection with prices
         model_id = st.selectbox(
             "Select Model",
             options=[m['id'] for m in models_info],
@@ -190,11 +188,11 @@ def dashboard_page():
 
         selected_model = next(m for m in models_info if m['id'] == model_id)
 
-        # Show model description and price
+        # Описание модели и цена
         st.write(f"**Description:** {selected_model['description']}")
         st.write(f"**Cost:** ${selected_model['price']}")
 
-        # Check balance before allowing prediction
+        # Проверка баланса
         if not check_balance(selected_model['price']):
             st.error(f"Insufficient balance. You need ${selected_model['price']} for this prediction.")
 
@@ -222,7 +220,7 @@ def dashboard_page():
                     if error:
                         st.error(f"Prediction failed: {error}")
                     else:
-                        # Immediately deduct from balance in UI
+                        # Списываем со счета
                         st.session_state.user['balance'] -= selected_model['price']
                         st.success(f"Prediction submitted! ID: {response['prediction_id']}")
                         st.rerun()
@@ -231,7 +229,7 @@ def dashboard_page():
                 st.error("Invalid JSON format")
                 return
 
-    # Prediction history
+    # История предсказаний
     st.header("🕒 Prediction History")
     with st.spinner("Loading your predictions..."):
         predictions, error = make_request("GET", "/predictions",
@@ -258,7 +256,6 @@ def dashboard_page():
                             st.json(full_pred)
 
 
-# Main app
 def main():
     if st.session_state.logged_in and st.session_state.user:
         dashboard_page()
