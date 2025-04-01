@@ -167,7 +167,11 @@ def dashboard_page():
                     st.rerun()
 
     # Available models with prices
-    models_response, error = make_request("GET", "/models", auth=(...))
+    models_response, error = make_request(
+        "GET",
+        "/models",
+        auth=(st.session_state.user['username'], st.session_state.password)
+    )
     models_info = [
         {"id": m["id"], "name": m["name"], "price": m["cost"], "description": m["description"]}
         for m in models_response
