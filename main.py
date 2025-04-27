@@ -1,165 +1,160 @@
 from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from typing import List, Optional
-import uuid
-from datetime import datetime
-
-from core.model.User import User
-from core.model.Account import Account
-from core.model.MLModel import MLModel
-from core.model.Prediction import Prediction
+from pydantic import BaseModel
 from core.dto.CreateAccountDto import CreateAccountDto
 from core.dto.CreatePredictionDto import CreatePredictionDto
+from core.db import (
+    init_db, create_user, get_user_by_username, get_account_by_user_id,
+    add_balance, subtract_balance, get_models, create_model, get_model_by_id,
+    create_prediction, get_prediction_by_id, get_predictions_by_user
+)
+import asyncio
+import joblib
+import numpy as np
+import pandas as pd
+import logging
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 security = HTTPBasic()
 
-# Mock database
-users_db = {}
-accounts_db = {}
-models_db = {}
-predictions_db = {}
+# Глобальный словарь для хранения моделей
+LOADED_MODELS = {}
 
+@app.on_event("startup")
+async def on_startup():
+    logger.info("Starting up...")
+    await init_db()
+    # Загружаем модели из файлов
+    global LOADED_MODELS
+    try:
+        LOADED_MODELS = {
+            "lr": joblib.load("model_lr.joblib"),
+            "rf": joblib.load("model_rf.joblib"),
+            "cb": joblib.load("model_cb.joblib")
+        }
+        logger.info(f"Models loaded: {list(LOADED_MODELS.keys())}")
+    except Exception as e:
+        logger.error(f"Error loading models: {e}")
+        raise
 
-# Initialize with some data
-def init_mock_data():
-    # Add admin user
-    admin_id = str(uuid.uuid4())
-    users_db[admin_id] = User(admin_id, "Admin", "admin", "admin123")
-    accounts_db[admin_id] = Account(str(uuid.uuid4()), admin_id, 1000.0)
+    # Инициализация моделей в БД, если нужно
+    models = await get_models()
+    logger.info(f"Existing models in DB: {len(models)}")
+    
+    if not models:
+        logger.info("No models found in DB, creating new ones...")
+        await create_model("Risk Assessment Model", 10.0, "Predicts investment risks", "lr")
+        await create_model("Return Prediction Model", 15.0, "Predicts investment returns", "rf")
+        await create_model("Premium Analysis Model", 20.0, "Advanced investment analysis", "cb")
+        logger.info("Models created in DB")
+    else:
+        logger.info(f"Models in DB: {[m['name'] for m in models]}")
 
-    # Add some models
-    model1_id = str(uuid.uuid4())
-    models_db[model1_id] = MLModel(model1_id, "Risk Assessment Model", 10.0, "Predicts investment risks")
-
-    model2_id = str(uuid.uuid4())
-    models_db[model2_id] = MLModel(model2_id, "Return Prediction Model", 15.0, "Predicts investment returns")
-
-
-init_mock_data()
-
-
-# Auth functions
 def get_current_user(credentials: HTTPBasicCredentials = Depends(security)):
-    user = None
-    for u in users_db.values():
-        if u.get_username() == credentials.username and u.verify_password(credentials.password):
-            user = u
-            break
+    async def _get():
+        user = await get_user_by_username(credentials.username)
+        if not user or user["password"] != credentials.password:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect username or password",
+                headers={"WWW-Authenticate": "Basic"},
+            )
+        return user
+    return asyncio.run(_get())
 
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password",
-            headers={"WWW-Authenticate": "Basic"},
-        )
-    return user
-
-
-# API Endpoints
 @app.post("/users")
-async def create_user(user_data: CreateAccountDto):
-    user_id = str(uuid.uuid4())
-    new_user = User(user_id, user_data.firstname, user_data.username, user_data.password)
-    users_db[user_id] = new_user
-
-    account_id = str(uuid.uuid4())
-    new_account = Account(account_id, user_id, 0.0)
-    accounts_db[user_id] = new_account
-
+async def create_user_endpoint(user_data: CreateAccountDto):
+    existing = await get_user_by_username(user_data.username)
+    if existing:
+        raise HTTPException(status_code=400, detail="Username already exists")
+    user_id = await create_user(user_data.firstname, user_data.username, user_data.password)
     return {"user_id": user_id, "message": "User created successfully"}
 
-
 @app.get("/users/me")
-async def get_current_user_info(user: User = Depends(get_current_user)):
-    account = accounts_db.get(user.get_id())
+async def get_current_user_info(user = Depends(get_current_user)):
+    account = await get_account_by_user_id(user["id"])
     return {
-        "user_id": user.get_id(),
-        "firstname": user.get_firstname(),
-        "username": user.get_username(),
-        "balance": account.get_balance() if account else 0.0
+        "user_id": user["id"],
+        "firstname": user["firstname"],
+        "username": user["username"],
+        "balance": account["balance"] if account else 0.0
     }
-
 
 @app.get("/models")
-async def get_models():
+async def get_models_endpoint():
+    models = await get_models()
+    logger.info(f"GET /models: returning {len(models)} models")
     return [{
-        "id": model.get_id(),
-        "name": model.get_name(),
-        "cost": model.get_cost(),
-        "description": model.get_description()
-    } for model in models_db.values()]
-
+        "id": m["id"],
+        "name": m["name"],
+        "cost": m["cost"],
+        "description": m["description"]
+    } for m in models]
 
 @app.post("/predict")
-async def create_prediction(prediction_data: CreatePredictionDto, user: User = Depends(get_current_user)):
-    # Check if model exists
-    model = models_db.get(prediction_data.model_id)
+async def create_prediction_endpoint(prediction_data: CreatePredictionDto, user = Depends(get_current_user)):
+    model = await get_model_by_id(prediction_data.model_id)
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")
-
-    # Check user balance
-    account = accounts_db.get(user.get_id())
-    if not account or account.get_balance() < model.get_cost():
+    account = await get_account_by_user_id(user["id"])
+    if not account or account["balance"] < model["cost"]:
         raise HTTPException(status_code=400, detail="Insufficient balance")
-
-    # Create prediction
-    prediction_id = str(uuid.uuid4())
-    new_prediction = Prediction(
-        prediction_id,
-        prediction_data.model_id,
-        user.get_id(),
-        prediction_data.input_data
-    )
-    predictions_db[prediction_id] = new_prediction
-
-    # Deduct balance (in real app this should be in transaction)
-    account.subtract_balance(model.get_cost())
-
-    # In real app, here you would queue the prediction task
-    # For demo, we'll just simulate it
-    return {"prediction_id": prediction_id, "message": "Prediction created successfully"}
-
+    await subtract_balance(user["id"], model["cost"])
+    # --- Предсказание ---
+    model_key = model["file_name"] if "file_name" in model.keys() else model["id"]
+    loaded_model = LOADED_MODELS.get(model_key)
+    if loaded_model is None:
+        raise HTTPException(status_code=500, detail="ML model not loaded")
+    # input_data должен быть dict с фичами, преобразуем в DataFrame
+    try:
+        X_pred = pd.DataFrame([prediction_data.input_data])
+        y_pred = loaded_model.predict(X_pred)
+        output_data = y_pred.tolist()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Prediction error: {e}")
+    prediction_id = await create_prediction(prediction_data.model_id, user["id"], prediction_data.input_data)
+    # Можно добавить сохранение output_data в БД, если нужно
+    return {"prediction_id": prediction_id, "output": output_data, "message": "Prediction created successfully"}
 
 @app.get("/predict/{prediction_id}")
-async def get_prediction(prediction_id: str, user: User = Depends(get_current_user)):
-    prediction = predictions_db.get(prediction_id)
+async def get_prediction_endpoint(prediction_id: str, user = Depends(get_current_user)):
+    prediction = await get_prediction_by_id(prediction_id)
     if not prediction:
         raise HTTPException(status_code=404, detail="Prediction not found")
-
-    if prediction.get_user_id() != user.get_id():
+    if prediction["user_id"] != user["id"]:
         raise HTTPException(status_code=403, detail="Not authorized to view this prediction")
-
     return {
-        "id": prediction.get_id(),
-        "model_id": prediction.get_model_id(),
-        "status": prediction.get_status(),
-        "input_data": prediction.get_input_data(),
-        "output_data": prediction.get_output_data(),
-        "created_at": prediction.created_at,
-        "updated_at": prediction.updated_at
+        "id": prediction["id"],
+        "model_id": prediction["model_id"],
+        "status": prediction["status"],
+        "input_data": prediction["input_data"],
+        "output_data": prediction["output_data"],
+        "created_at": prediction["created_at"],
+        "updated_at": prediction["updated_at"]
     }
 
+class TopUpDto(BaseModel):
+    amount: float
 
 @app.post("/account/topup")
-async def topup_account(amount: float, user: User = Depends(get_current_user)):
+async def topup_account(data: TopUpDto, user = Depends(get_current_user)):
+    amount = data.amount
     if amount <= 0:
         raise HTTPException(status_code=400, detail="Amount must be positive")
-
-    account = accounts_db.get(user.get_id())
-    if not account:
-        raise HTTPException(status_code=404, detail="Account not found")
-
-    account.add_balance(amount)
-    return {"message": f"Account topped up successfully. New balance: {account.get_balance()}"}
-
+    await add_balance(user["id"], amount)
+    account = await get_account_by_user_id(user["id"])
+    return {"message": f"Account topped up successfully. New balance: {account['balance']}"}
 
 @app.get("/predictions")
-async def get_user_predictions(user: User = Depends(get_current_user)):
-    user_predictions = [p for p in predictions_db.values() if p.get_user_id() == user.get_id()]
+async def get_user_predictions_endpoint(user = Depends(get_current_user)):
+    predictions = await get_predictions_by_user(user["id"])
     return [{
-        "id": p.get_id(),
-        "model_id": p.get_model_id(),
-        "status": p.get_status(),
-        "created_at": p.created_at
-    } for p in user_predictions]
+        "id": p["id"],
+        "model_id": p["model_id"],
+        "status": p["status"],
+        "created_at": p["created_at"]
+    } for p in predictions]

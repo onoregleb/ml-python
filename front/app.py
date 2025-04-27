@@ -1,7 +1,11 @@
 import streamlit as st
 import requests
 import json
+import joblib
+import io
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 from datetime import datetime
+import pandas as pd
 
 # Config
 API_BASE_URL = "http://127.0.0.1:8000"  # Какой порт слушаем
@@ -15,14 +19,6 @@ if 'user' not in st.session_state:
     st.session_state.user = None
 if 'password' not in st.session_state:
     st.session_state.password = ""
-
-# Цены на модели
-MODEL_PRICES = {
-    "risk_model": 5,
-    "return_model": 10,
-    "premium_model": 20
-}
-
 
 # Вспомогательная функция
 def make_request(method, endpoint, data=None, auth=None):
@@ -151,7 +147,7 @@ def dashboard_page():
         if st.button("Top Up Now"):
             with st.spinner("Processing payment..."):
                 _, error = make_request("POST", "/account/topup",
-                                        data=amount,
+                                        data={"amount": amount},
                                         auth=(st.session_state.user['username'],
                                               st.session_state.password))
                 if error:
@@ -178,6 +174,20 @@ def dashboard_page():
 
     # Секция с предсказаниями
     st.header("📊 Make a Prediction")
+    
+    # Кнопка для скачивания примера CSV (вне формы)
+    if st.button("Download Sample CSV"):
+        try:
+            with open('sample_data.csv', 'rb') as f:
+                st.download_button(
+                    label="Download Sample CSV",
+                    data=f,
+                    file_name="sample_data.csv",
+                    mime="text/csv"
+                )
+        except:
+            st.warning("Sample CSV file not found. Please run model_training.py first.")
+
     with st.form("prediction_form"):
         model_id = st.selectbox(
             "Select Model",
@@ -196,17 +206,59 @@ def dashboard_page():
         if not check_balance(selected_model['price']):
             st.error(f"Insufficient balance. You need ${selected_model['price']} for this prediction.")
 
-        input_data = st.text_area(
-            "Input Data (JSON format)",
-            value='{"data": "your input here"}',
-            height=150
+        # Добавляем выбор способа ввода данных
+        input_method = st.radio(
+            "Choose input method:",
+            ["Manual Input", "Upload CSV"]
         )
+
+        if input_method == "Manual Input":
+            input_data = st.text_area(
+                "Input Data (JSON format)",
+                value='{"feature_0": 0.0, "feature_1": 0.0, "feature_2": 0.0, "feature_3": 0.0, "feature_4": 0.0}',
+                height=150
+            )
+        else:
+            # Загрузка CSV файла
+            uploaded_file = st.file_uploader(
+                "Upload your CSV file",
+                type=["csv"],
+                help="CSV file should contain columns: feature_0, feature_1, feature_2, feature_3, feature_4"
+            )
+            
+            if uploaded_file is not None:
+                try:
+                    df = pd.read_csv(uploaded_file)
+                    required_columns = ['feature_0', 'feature_1', 'feature_2', 'feature_3', 'feature_4']
+                    
+                    # Проверяем наличие всех необходимых колонок
+                    if all(col in df.columns for col in required_columns):
+                        # Показываем предпросмотр данных
+                        st.write("Preview of your data:")
+                        st.dataframe(df[required_columns].head())
+                        
+                        # Конвертируем в словарь
+                        input_data = df[required_columns].iloc[0].to_dict()
+                        st.success("CSV file loaded successfully!")
+                    else:
+                        missing_columns = [col for col in required_columns if col not in df.columns]
+                        st.error(f"Missing required columns: {', '.join(missing_columns)}")
+                        st.info("Required columns: feature_0, feature_1, feature_2, feature_3, feature_4")
+                        input_data = None
+                except Exception as e:
+                    st.error(f"Error reading CSV file: {str(e)}")
+                    input_data = None
 
         submitted = st.form_submit_button("Submit Prediction", disabled=not check_balance(selected_model['price']))
 
-        if submitted:
+        if submitted and input_data:
             try:
-                json_data = json.loads(input_data)
+                # Если это ручной ввод, парсим JSON
+                if input_method == "Manual Input":
+                    json_data = json.loads(input_data)
+                else:
+                    # Если это CSV, у нас уже есть словарь
+                    json_data = input_data
 
                 with st.spinner("Processing prediction..."):
                     data = {
