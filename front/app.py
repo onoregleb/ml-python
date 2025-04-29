@@ -1,16 +1,14 @@
 import streamlit as st
 import requests
 import json
-import joblib
-import io
-from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 from datetime import datetime
 import pandas as pd
+import io
 
 # Config
-API_BASE_URL = "http://127.0.0.1:8000"  # Какой порт слушаем
+API_BASE_URL = "http://127.0.0.1:8000"
 
-# Инициализация состояний сессии
+# --- Инициализация состояний сессии ---
 if 'logged_in' not in st.session_state:
     st.session_state.logged_in = False
 if 'page' not in st.session_state:
@@ -19,47 +17,80 @@ if 'user' not in st.session_state:
     st.session_state.user = None
 if 'password' not in st.session_state:
     st.session_state.password = ""
+if 'input_method' not in st.session_state:
+    st.session_state.input_method = "Manual Input" # Значение по умолчанию
 
-# Вспомогательная функция
-def make_request(method, endpoint, data=None, auth=None):
+# --- Вспомогательная функция ---
+def make_request(method, endpoint, data=None, auth=None, files=None):
+    """Отправляет запрос к API и обрабатывает ответ."""
     url = f"{API_BASE_URL}{endpoint}"
     try:
-        if method == "GET":
-            response = requests.get(url, auth=auth)
-        elif method == "POST":
-            response = requests.post(url, json=data, auth=auth)
-        else:
-            return None, "Invalid method"
+        headers = {}
+        if data is not None and files is None:
+            # Отправляем JSON только если нет файлов
+            headers["Content-Type"] = "application/json"
 
+        response = None
+        if method == "GET":
+            response = requests.get(url, auth=auth, headers=headers)
+        elif method == "POST":
+            response = requests.post(url, json=data, auth=auth, headers=headers, files=files)
+        else:
+            return None, "Invalid HTTP method specified"
+
+        # Обработка кодов состояния
         if response.status_code == 200:
-            return response.json(), None
+            content_type = response.headers.get("Content-Type", "")
+            if "application/json" in content_type:
+                try:
+                    return response.json(), None
+                except json.JSONDecodeError:
+                    return None, "Invalid JSON received from server"
+            else:
+                return {"raw_text": response.text}, None
         else:
             try:
-                error_detail = response.json().get("detail", "Unknown error")
-            except:
-                error_detail = response.text
+                error_detail = response.json().get("detail", response.text)
+            except json.JSONDecodeError:
+                error_detail = response.text  # Если ответ не JSON
+            st.error(f"API Error ({response.status_code}): {error_detail}")
             return None, error_detail
+
+    except requests.exceptions.ConnectionError:
+        error_msg = f"Connection Error: Could not connect to API at {url}. Is the backend running?"
+        st.error(error_msg)
+        return None, error_msg
     except Exception as e:
-        return None, str(e)
+        error_msg = f"An unexpected error occurred: {str(e)}"
+        st.error(error_msg)
+        return None, error_msg
 
 
+# --- Функции управления сессией ---
 def logout():
+    """Сбрасывает состояние сессии для выхода пользователя."""
     st.session_state.logged_in = False
     st.session_state.user = None
     st.session_state.password = ""
     st.session_state.page = "login"
+    st.session_state.input_method = "Manual Input" # Сброс при выходе
     st.rerun()
 
-
 def check_balance(required_amount):
-    """Проверка на достаточность баланса"""
-    if not st.session_state.user:
+    """Проверяет, достаточно ли средств на балансе пользователя."""
+    if not st.session_state.user or 'balance' not in st.session_state.user:
         return False
-    return st.session_state.user['balance'] >= required_amount
+    try:
+        current_balance = float(st.session_state.user['balance'])
+        return current_balance >= float(required_amount)
+    except (ValueError, TypeError):
+        st.error("Invalid balance format received from API.")
+        return False
 
 
-# Pages
+# --- Страницы ---
 def login_page():
+    """Страница входа пользователя."""
     st.title("ML Service Login")
 
     username = st.text_input("Username")
@@ -76,20 +107,23 @@ def login_page():
                 response, error = make_request("GET", "/users/me", auth=(username, password))
 
                 if error:
-                    st.error(f"Login failed: {error}")
-                else:
+                    pass
+                elif response:
                     st.session_state.user = response
-                    st.session_state.password = password
+                    st.session_state.password = password # Сохраняем пароль для будущих запросов
                     st.session_state.logged_in = True
+                    st.session_state.page = "dashboard" # Перенаправляем на дашборд
                     st.success("Login successful!")
-                    st.rerun()
+                    st.rerun() # Перезапускаем для отображения новой страницы
+                else:
+                    st.error("Login failed. Unknown error.")
     with col2:
         if st.button("Go to Register"):
             st.session_state.page = "register"
             st.rerun()
 
-
 def register_page():
+    """Страница регистрации нового пользователя."""
     st.title("Register New Account")
 
     firstname = st.text_input("First Name")
@@ -113,210 +147,374 @@ def register_page():
                 response, error = make_request("POST", "/users", data=data)
 
                 if error:
-                    st.error(f"Registration failed: {error}")
-                else:
+                     pass
+                elif response:
                     st.success("Registration successful! Please login.")
                     st.session_state.page = "login"
                     st.rerun()
+                else:
+                    st.error("Registration failed. Unknown error.")
+
     with col2:
         if st.button("Back to Login"):
             st.session_state.page = "login"
             st.rerun()
 
-
 def dashboard_page():
+    """Главная страница приложения после входа."""
     st.title("ML Service Dashboard")
 
-    # Проверка успешности авторизации
-    if not st.session_state.user or not st.session_state.password:
-        st.error("Authentication error. Please login again.")
-        logout()
+    if not st.session_state.user or not st.session_state.password or 'username' not in st.session_state.user or 'balance' not in st.session_state.user:
+        st.error("Authentication error or missing user data. Please login again.")
+        logout() # Выходим, если данные некорректны
         return
+
+    auth = (st.session_state.user['username'], st.session_state.password)
 
     col1, col2 = st.columns([4, 1])
     with col1:
-        st.write(f"Welcome, {st.session_state.user['firstname']}!")
-        st.write(f"Your balance: ${st.session_state.user['balance']:.2f}")
+        st.write(f"Welcome, {st.session_state.user.get('firstname', 'User')}!")
+        try:
+            balance_float = float(st.session_state.user['balance'])
+            st.write(f"Your balance: ${balance_float:.2f}")
+        except (ValueError, TypeError):
+             st.write(f"Your balance: Invalid format ({st.session_state.user['balance']})")
+
     with col2:
         if st.button("Logout"):
             logout()
+            return
 
     # Пополнение баланса
     with st.expander("💳 Top Up Balance", expanded=False):
-        amount = st.number_input("Amount to add", min_value=1.0, step=1.0, value=10.0)
+        amount = st.number_input("Amount to add", min_value=1.0, step=1.0, value=10.0, key="topup_amount")
         if st.button("Top Up Now"):
-            with st.spinner("Processing payment..."):
-                _, error = make_request("POST", "/account/topup",
-                                        data={"amount": amount},
-                                        auth=(st.session_state.user['username'],
-                                              st.session_state.password))
-                if error:
-                    st.error(f"Top up failed: {error}")
-                else:
-                    # Refresh user data
-                    response, _ = make_request("GET", "/users/me",
-                                               auth=(st.session_state.user['username'],
-                                                     st.session_state.password))
-                    st.session_state.user = response
-                    st.success("Balance topped up successfully!")
-                    st.rerun()
+            if amount <= 0:
+                st.warning("Please enter a positive amount to top up.")
+            else:
+                with st.spinner("Processing payment..."):
+                    _, error = make_request("POST", "/account/topup",
+                                            data={"amount": amount},
+                                            auth=auth)
+                    if error:
+                        pass
+                    else:
+                        response, fetch_error = make_request("GET", "/users/me", auth=auth)
+                        if fetch_error:
+                             st.warning("Could not refresh user data after top-up.")
+                        elif response:
+                            st.session_state.user = response
+                            st.success("Balance topped up successfully!")
+                            st.rerun()
 
     # Получение доступных моделей
-    models_response, error = make_request(
-        "GET",
-        "/models",
-        auth=(st.session_state.user['username'], st.session_state.password)
-    )
-    models_info = [
-        {"id": m["id"], "name": m["name"], "price": m["cost"], "description": m["description"]}
-        for m in models_response
-    ]
+    st.subheader("Available Models")
+    models_info = []
+    with st.spinner("Loading available models..."):
+        models_response, error = make_request("GET", "/models", auth=auth)
 
-    # Секция с предсказаниями
+    if error:
+        st.error("Failed to load models list.")
+    elif not models_response:
+         st.warning("No models available at the moment.")
+    else:
+        models_info = [
+            {"id": m.get("id"), "name": m.get("name", "Unnamed Model"),
+             "cost": m.get("cost", 0.0), "description": m.get("description", "No description")}
+            for m in models_response if m.get("id") is not None
+        ]
+        if not models_info:
+             st.warning("Received model data, but could not parse it correctly or no valid models found.")
+
+
+    # --- Секция с предсказаниями ---
     st.header("📊 Make a Prediction")
-    
-    # Кнопка для скачивания примера CSV (вне формы)
-    if st.button("Download Sample CSV"):
-        try:
-            with open('sample_data.csv', 'rb') as f:
-                st.download_button(
-                    label="Download Sample CSV",
-                    data=f,
-                    file_name="sample_data.csv",
-                    mime="text/csv"
-                )
-        except:
-            st.warning("Sample CSV file not found. Please run model_training.py first.")
 
+    try:
+        with open('sample_data.csv', 'rb') as f:
+            st.download_button(
+                label="Download Sample CSV for Features",
+                data=f,
+                file_name="sample_data.csv",
+                mime="text/csv",
+                key="download_sample"
+            )
+    except FileNotFoundError:
+        st.warning("Sample CSV file ('sample_data.csv') not found.")
+    except Exception as e:
+         st.error(f"Could not provide sample CSV: {e}")
+
+    st.radio(
+        "Choose input method:",
+        ["Manual Input", "Upload CSV"],
+        key="input_method"
+    )
+
+    # --- Сама форма предсказаний ---
     with st.form("prediction_form"):
+        if not models_info:
+             st.error("Cannot make predictions: No models are available.")
+             st.form_submit_button("Submit Prediction", disabled=True)
+             return
+
+        model_options = {m['id']: f"{m['name']} (${m['cost']:.2f})" for m in models_info}
+        if not model_options:
+            st.error("Model options could not be created.")
+            st.form_submit_button("Submit Prediction", disabled=True)
+            return
+
         model_id = st.selectbox(
             "Select Model",
-            options=[m['id'] for m in models_info],
-            format_func=lambda
-                x: f"{next(m['name'] for m in models_info if m['id'] == x)} (${next(m['price'] for m in models_info if m['id'] == x)})"
+            options=list(model_options.keys()),
+            format_func=lambda x: model_options.get(x, "Invalid Model ID"),
+            key="selected_model_id"
         )
 
-        selected_model = next(m for m in models_info if m['id'] == model_id)
+        selected_model = next((m for m in models_info if m['id'] == model_id), None)
 
-        # Описание модели и цена
+        if not selected_model:
+            st.error("Selected model details not found. Please try again.")
+            st.form_submit_button("Submit Prediction", disabled=True)
+            return
+
         st.write(f"**Description:** {selected_model['description']}")
-        st.write(f"**Cost:** ${selected_model['price']}")
+        st.write(f"**Cost per prediction:** ${selected_model['cost']:.2f}")
 
-        # Проверка баланса
-        if not check_balance(selected_model['price']):
-            st.error(f"Insufficient balance. You need ${selected_model['price']} for this prediction.")
+        input_data_for_submission = None
+        num_predictions_to_process = 0
+        total_cost = 0.0
 
-        # Добавляем выбор способа ввода данных
-        input_method = st.radio(
-            "Choose input method:",
-            ["Manual Input", "Upload CSV"]
-        )
-
-        if input_method == "Manual Input":
-            input_data = st.text_area(
-                "Input Data (JSON format)",
-                value='{"feature_0": 0.0, "feature_1": 0.0, "feature_2": 0.0, "feature_3": 0.0, "feature_4": 0.0}',
-                height=150
+        if st.session_state.input_method == "Manual Input":
+            input_data_str = st.text_area(
+                "Input Data (JSON format, single prediction)",
+                value='{"feature_0": 0.1, "feature_1": 0.2, "feature_2": 0.3, "feature_3": 0.4, "feature_4": 0.5}',
+                height=150,
+                key="manual_input_area",
+                help="Enter the features for a single prediction as a JSON object."
             )
+            # Расчет стоимости придет после Submit
+
         else:
-            # Загрузка CSV файла
             uploaded_file = st.file_uploader(
                 "Upload your CSV file",
                 type=["csv"],
-                help="CSV file should contain columns: feature_0, feature_1, feature_2, feature_3, feature_4"
+                key="csv_uploader",
+                help="Upload a CSV file. It should contain columns: feature_0, feature_1, ..., feature_4. All data rows will be sent as one prediction request priced at the model's cost."
             )
-            
+
+            input_data_from_csv_list = None
+
             if uploaded_file is not None:
                 try:
-                    df = pd.read_csv(uploaded_file)
+                    csv_bytes = uploaded_file.getvalue()
+                    csv_io = io.BytesIO(csv_bytes)
+
                     required_columns = ['feature_0', 'feature_1', 'feature_2', 'feature_3', 'feature_4']
-                    
-                    # Проверяем наличие всех необходимых колонок
-                    if all(col in df.columns for col in required_columns):
-                        # Показываем предпросмотр данных
-                        st.write("Preview of your data:")
-                        st.dataframe(df[required_columns].head())
-                        
-                        # Конвертируем в словарь
-                        input_data = df[required_columns].iloc[0].to_dict()
-                        st.success("CSV file loaded successfully!")
-                    else:
+                    df = pd.read_csv(csv_io)
+
+                    if not all(col in df.columns for col in required_columns):
                         missing_columns = [col for col in required_columns if col not in df.columns]
-                        st.error(f"Missing required columns: {', '.join(missing_columns)}")
-                        st.info("Required columns: feature_0, feature_1, feature_2, feature_3, feature_4")
-                        input_data = None
-                except Exception as e:
-                    st.error(f"Error reading CSV file: {str(e)}")
-                    input_data = None
-
-        submitted = st.form_submit_button("Submit Prediction", disabled=not check_balance(selected_model['price']))
-
-        if submitted and input_data:
-            try:
-                # Если это ручной ввод, парсим JSON
-                if input_method == "Manual Input":
-                    json_data = json.loads(input_data)
-                else:
-                    # Если это CSV, у нас уже есть словарь
-                    json_data = input_data
-
-                with st.spinner("Processing prediction..."):
-                    data = {
-                        "model_id": model_id,
-                        "input_data": json_data
-                    }
-                    response, error = make_request("POST", "/predict",
-                                                   data=data,
-                                                   auth=(st.session_state.user['username'],
-                                                         st.session_state.password))
-                    if error:
-                        st.error(f"Prediction failed: {error}")
+                        st.error(f"Missing required columns in CSV: {', '.join(missing_columns)}")
+                        st.info(f"Required columns: {', '.join(required_columns)}")
+                        input_data_from_csv_list = None
+                    elif df.empty:
+                        st.error("The uploaded CSV file is empty or contains no data rows.")
+                        input_data_from_csv_list = None
                     else:
-                        # Списываем со счета
-                        st.session_state.user['balance'] -= selected_model['price']
-                        st.success(f"Prediction submitted! ID: {response['prediction_id']}")
-                        st.rerun()
+                        input_data_from_csv_list = df[required_columns].to_dict('records')
+                        num_rows_in_csv = len(input_data_from_csv_list)
+                        st.success(f"CSV file loaded successfully! Found {num_rows_in_csv} data rows.")
+                        if num_rows_in_csv > 0:
+                             st.write("Preview of the data to be used:")
+                             st.dataframe(df[required_columns].head())
+                        else:
+                             st.warning("CSV file contains headers but no data rows.")
 
-            except json.JSONDecodeError:
-                st.error("Invalid JSON format")
-                return
 
-    # История предсказаний
+                except pd.errors.EmptyDataError:
+                    st.error("The uploaded CSV file is empty or invalid.")
+                    input_data_from_csv_list = None
+                except Exception as e:
+                    st.error(f"Error reading or processing CSV file: {str(e)}")
+                    input_data_from_csv_list = None
+
+                input_data_for_submission = input_data_from_csv_list
+                if input_data_for_submission is not None and len(input_data_for_submission) > 0:
+                     num_predictions_to_process = 1
+                else:
+                     num_predictions_to_process = 0
+
+
+        can_afford_one = check_balance(selected_model['cost'])
+        if not can_afford_one:
+             st.error(f"Insufficient balance. You need at least ${selected_model['cost']:.2f} to submit a request. Please top up.")
+
+
+        # --- Кнопка отправки формы ---
+        submitted = st.form_submit_button(
+            "Submit Prediction",
+            disabled=not can_afford_one # Отключаем, если даже на 1 предсказание не хватает
+        )
+
+        # --- Логика обработки после нажатия Submit ---
+        if submitted:
+            current_balance_float = float(st.session_state.user['balance'])
+
+            if st.session_state.input_method == "Manual Input":
+                try:
+                    parsed_data = json.loads(input_data_str)
+                    if not isinstance(parsed_data, dict):
+                         st.error("Invalid format: Manual input must be a JSON object (dictionary).")
+                         input_data_for_submission = None
+                         num_predictions_to_process = 0
+                    else:
+                         input_data_for_submission = parsed_data
+                         num_predictions_to_process = 1
+
+                except json.JSONDecodeError:
+                    st.error("Invalid JSON format in manual input. Please check your syntax.")
+                    input_data_for_submission = None
+                    num_predictions_to_process = 0
+                except Exception as e:
+                     st.error(f"Error processing manual input: {e}")
+                     input_data_for_submission = None
+                     num_predictions_to_process = 0
+
+                total_cost = selected_model['cost'] * num_predictions_to_process
+
+            else:
+                if input_data_for_submission is not None and num_predictions_to_process == 1:
+                     total_cost = selected_model['cost'] * num_predictions_to_process # Умножение на 1
+                elif uploaded_file is None:
+                    st.error("Please upload a CSV file.")
+                    input_data_for_submission = None
+                    num_predictions_to_process = 0
+                    total_cost = 0.0
+                else:
+                     st.warning("Cannot submit. Please fix the issues with the uploaded CSV file.")
+                     input_data_for_submission = None
+                     num_predictions_to_process = 0
+                     total_cost = 0.0
+
+            #Отправка запроса на предсказание, если данные готовы и баланс достаточен
+            if input_data_for_submission is not None and num_predictions_to_process > 0:
+                if current_balance_float >= total_cost:
+                    with st.spinner(f"Processing request (cost: ${total_cost:.2f})..."):
+                        payload = {
+                            "model_id": model_id,
+                            "input_data": input_data_for_submission  # dict или list of dicts
+                        }
+                        response, error = make_request("POST", "/predict", data=payload, auth=auth)
+
+                        if error:
+                            st.error("Prediction request failed.")
+                        elif response:
+                            try:
+                                # Пытаемся обновить баланс
+                                st.session_state.user['balance'] = current_balance_float - total_cost
+                            except (ValueError, TypeError, KeyError):
+                                st.warning("Could not update balance display locally.")
+
+                            # Здесь отображаем предсказания
+                            if isinstance(response, dict):
+                                st.success("Prediction completed successfully!")
+                                st.json(response)
+                            elif isinstance(response, str):
+                                st.success("Prediction completed successfully!")
+                                st.text_area("Prediction Result (raw text):", response, height=300)
+                            else:
+                                st.warning("Received unexpected response format.")
+
+                            st.rerun()  # Обновить баланс и историю
+                        else:
+                            st.error("Prediction request completed, but response is empty.")
+                else:
+                    st.error(
+                        f"Insufficient balance. You need ${total_cost:.2f} for this request. Your current balance is ${current_balance_float:.2f}. Please top up.")
+            elif input_data_for_submission is None or num_predictions_to_process == 0:
+                st.warning(
+                    "Cannot submit prediction. Please ensure your input data is correct (valid JSON or properly formatted CSV with data).")
+
+    # --- История предсказаний ---
     st.header("🕒 Prediction History")
-    with st.spinner("Loading your predictions..."):
-        predictions, error = make_request("GET", "/predictions",
-                                          auth=(st.session_state.user['username'],
-                                                st.session_state.password))
+    with st.spinner("Loading your prediction history..."):
+        predictions_response, error = make_request("GET", "/predictions", auth=auth)
 
     if error:
-        st.error(f"Failed to load predictions: {error}")
-    elif not predictions:
+        st.error(f"Failed to load prediction history.")
+    elif not predictions_response:
         st.info("You haven't made any predictions yet.")
     else:
-        for pred in predictions:
-            with st.expander(f"🔮 {pred['id']} - {pred['status'].capitalize()}", expanded=False):
-                model_name = next((m['name'] for m in models_info if m['id'] == pred['model_id']), "Unknown Model")
-                st.write(f"**Model:** {model_name}")
-                st.write(f"**Created:** {datetime.fromisoformat(pred['created_at']).strftime('%Y-%m-%d %H:%M')}")
+        predictions = predictions_response
 
-                if st.button("View Details", key=f"view_{pred['id']}"):
-                    with st.spinner("Loading details..."):
-                        full_pred, _ = make_request("GET", f"/predict/{pred['id']}",
-                                                    auth=(st.session_state.user['username'],
-                                                          st.session_state.password))
-                        if full_pred:
-                            st.json(full_pred)
+        sorted_predictions = sorted(predictions, key=lambda x: x.get('created_at', ''), reverse=True)
+
+        if not sorted_predictions:
+             st.info("No prediction records found.")
+        else:
+            for pred in sorted_predictions[:10]:
+                pred_id = pred.get('id', 'N/A')
+                status = pred.get('status', 'Unknown').capitalize()
+                model_id_hist = pred.get('model_id')
+                created_at_iso = pred.get('created_at')
+
+                model_name = next((m['name'] for m in models_info if m.get('id') == model_id_hist), "Unknown Model")
+
+                try:
+                    created_at_str = datetime.fromisoformat(created_at_iso.replace('Z', '+00:00')).strftime('%Y-%m-%d %H:%M:%S') if created_at_iso else "N/A"
+                except ValueError:
+                    created_at_str = str(created_at_iso)
+
+                status_color = "blue"
+                if status == "Completed":
+                    status_color = "green"
+                elif status == "Failed":
+                    status_color = "red"
+                elif status == "Pending":
+                    status_color = "orange"
+
+                expander_title = f"🔮 ID: {pred_id} | Status: :{status_color}[{status}] | Model: {model_name} | Time: {created_at_str}"
+
+                with st.expander(expander_title, expanded=False):
+                    if st.button("View Details", key=f"view_detail_{pred_id}"):
+                        with st.spinner(f"Loading details for prediction {pred_id}..."):
+                            full_pred, detail_error = make_request("GET", f"/predict/{pred_id}", auth=auth)
+                            if detail_error:
+                                 st.error(f"Could not load details for prediction {pred_id}.")
+                            elif full_pred:
+                                st.write("**Input Data:**")
+                                input_data_display = full_pred.get("input_data", "Not available")
+                                if isinstance(input_data_display, list) and len(input_data_display) > 5:
+                                    st.json(input_data_display[:5])
+                                    st.write(f"... and {len(input_data_display) - 5} more items. Full data available in raw JSON.")
+                                else:
+                                    st.json(input_data_display)
 
 
+                                st.write("**Output Data:**")
+                                output_data_display = full_pred.get("output_data", "Not available or prediction not finished")
+                                if isinstance(output_data_display, list) and len(output_data_display) > 5:
+                                     st.json(output_data_display[:5])
+                                     st.write(f"... and {len(output_data_display) - 5} more items. Full data available in raw JSON.")
+                                else:
+                                     st.json(output_data_display)
+
+                                st.write("**Full Details (Raw JSON):**")
+                                st.json(full_pred)
+                            else:
+                                st.warning("Received no details for this prediction.")
+
+
+# --- Основная логика приложения ---
 def main():
+    """Определяет, какую страницу показать."""
     if st.session_state.logged_in and st.session_state.user:
         dashboard_page()
     else:
-        if st.session_state.page == "login":
-            login_page()
-        else:
+        if st.session_state.page == "register":
             register_page()
-
+        else:
+            login_page()
 
 if __name__ == "__main__":
     main()
