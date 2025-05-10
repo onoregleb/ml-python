@@ -122,35 +122,23 @@ def check_balance(required_amount):
 
 def check_pending_predictions(auth):
     """
-    Проверяет статус предсказаний и обновляет страницу при наличии изменений.
+    Проверяет статус предсказаний и возвращает информацию о них.
     
-    Функция вызывается автоматически при включенном auto-refresh и выполняет:
-    1. Проверку времени с последнего обновления (не чаще 10 секунд)
-    2. Получает актуальный статус всех предсказаний напрямую через API
-    3. Отображение информационного сообщения о статусе предсказаний
-    4. Проверку изменений статуса для всех предсказаний
+    Функция используется для ручного обновления статуса предсказаний.
     
     Args:
         auth (tuple): Аутентификационные данные пользователя (username, password)
         
     Returns:
-        bool: True, если нужно обновить страницу, иначе False
+        tuple: (количество pending предсказаний, нужно ли обновить страницу)
     """
-    # Получаем текущее время
-    current_time = datetime.now()
-    
-    # Проверяем, прошло ли достаточно времени с последней проверки (5 секунд)
-    time_since_last_check = (current_time - st.session_state.last_status_check_time).total_seconds()
-    if time_since_last_check < 5:  # Уменьшаем интервал для более быстрого обновления
-        return False  # Еще не прошло 5 секунд с последней проверки
-    
     # Обновляем время последней проверки
-    st.session_state.last_status_check_time = current_time
+    st.session_state.last_status_check_time = datetime.now()
     
     # Получаем историю предсказаний
     predictions_response, error = make_request("GET", "/predictions", auth=auth)
     if error or not predictions_response:
-        return False
+        return 0, False
     
     # Инициализируем счетчик реальных pending-предсказаний
     actual_pending_count = 0
@@ -181,15 +169,9 @@ def check_pending_predictions(auth):
     
     # Отображаем информацию о pending предсказаниях с актуальным счетчиком
     if actual_pending_count > 0:
-        st.info(f"You have {actual_pending_count} pending prediction(s). Auto-refreshing is {'enabled' if st.session_state.auto_refresh_enabled else 'disabled'}.")
+        st.info(f"You have {actual_pending_count} pending prediction(s). Use 'Refresh Predictions' to check for updates.")
     
-    # Обновляем страницу, если:
-    # 1. Статус какого-либо предсказания изменился
-    # 2. Есть активные pending предсказания и auto-refresh включен
-    if status_changed or (actual_pending_count > 0 and st.session_state.auto_refresh_enabled):
-        return True
-        
-    return False
+    return actual_pending_count, status_changed
 
 # --- Страницы ---
 def login_page():
@@ -301,11 +283,8 @@ def dashboard_page():
 
     auth = (st.session_state.user['username'], st.session_state.password)
     
-    # Автоматическая проверка статуса предсказаний
-    if st.session_state.auto_refresh_enabled:
-        if check_pending_predictions(auth):
-            # Если статус изменился, перезагружаем страницу
-            st.rerun()
+    # Проверка статуса предсказаний при загрузке страницы
+    pending_count, _ = check_pending_predictions(auth)
 
     col1, col2, col3 = st.columns([3, 1, 1])
     with col1:
@@ -317,12 +296,12 @@ def dashboard_page():
              st.write(f"Your balance: Invalid format ({st.session_state.user['balance']})")
 
     with col2:
-        # Добавляем переключатель для автоматического обновления
-        auto_refresh = st.checkbox("Auto refresh", value=st.session_state.auto_refresh_enabled,
-                                  help="Automatically check prediction status every 10 seconds")
-        if auto_refresh != st.session_state.auto_refresh_enabled:
-            st.session_state.auto_refresh_enabled = auto_refresh
-            st.session_state.last_status_check_time = datetime.now()
+        # Добавляем кнопку обновления предсказаний
+        if st.button("Refresh Predictions"):
+            pending_count, status_changed = check_pending_predictions(auth)
+            if status_changed:
+                st.success("Status updated!")
+                st.rerun()
     
     with col3:
         if st.button("Logout"):
