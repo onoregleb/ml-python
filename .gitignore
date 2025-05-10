@@ -2,6 +2,6 @@
 .idea/
 __pycache__/
 .cache
-catboot_info/
+catboost_info/
 ml_service.db
 train_models.py
