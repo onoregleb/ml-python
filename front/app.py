@@ -23,8 +23,7 @@ if 'prediction_status_check' not in st.session_state:
     st.session_state.prediction_status_check = {}
 if 'last_status_check_time' not in st.session_state:
     st.session_state.last_status_check_time = datetime.now()
-if 'auto_refresh_enabled' not in st.session_state:
-    st.session_state.auto_refresh_enabled = True
+# Auto-refresh was removed due to reliability issues
 
 # --- Вспомогательная функция ---
 def make_request(method, endpoint, data=None, auth=None, files=None):
@@ -127,7 +126,7 @@ def check_pending_predictions(auth):
     
     Функция вызывается автоматически при включенном auto-refresh и выполняет:
     1. Проверку времени с последнего обновления (не чаще 10 секунд)
-    2. Подсчет количества ожидающих (pending) предсказаний
+    2. Получает актуальный статус всех предсказаний напрямую через API
     3. Отображение информационного сообщения о статусе предсказаний
     4. Проверку изменений статуса для всех предсказаний
     
@@ -140,10 +139,10 @@ def check_pending_predictions(auth):
     # Получаем текущее время
     current_time = datetime.now()
     
-    # Проверяем, прошло ли достаточно времени с последней проверки (10 секунд)
+    # Проверяем, прошло ли достаточно времени с последней проверки (5 секунд)
     time_since_last_check = (current_time - st.session_state.last_status_check_time).total_seconds()
-    if time_since_last_check < 10:
-        return False  # Еще не прошло 10 секунд с последней проверки
+    if time_since_last_check < 5:  # Уменьшаем интервал для более быстрого обновления
+        return False  # Еще не прошло 5 секунд с последней проверки
     
     # Обновляем время последней проверки
     st.session_state.last_status_check_time = current_time
@@ -153,31 +152,41 @@ def check_pending_predictions(auth):
     if error or not predictions_response:
         return False
     
-    # Проверяем наличие предсказаний и считаем сколько из них в статусе 'pending'
-    pending_count = sum(1 for pred in predictions_response if pred.get('status') == 'pending')
+    # Инициализируем счетчик реальных pending-предсказаний
+    actual_pending_count = 0
+    status_changed = False
     
-    # Отображаем информацию о pending предсказаниях
-    if pending_count > 0:
-        st.info(f"You have {pending_count} pending prediction(s). Auto-refreshing is {'enabled' if st.session_state.auto_refresh_enabled else 'disabled'}.")
-    
-    # Проверяем каждое предсказание на изменение статуса
+    # Проверяем каждое предсказание, получая его актуальный статус
     for pred in predictions_response:
         pred_id = pred.get('id')
         if not pred_id:
             continue
             
-        # Проверяем статус для этого предсказания
+        # Получаем актуальный статус через детальный API endpoint
         pred_detail, detail_error = make_request("GET", f"/predict/{pred_id}", auth=auth)
-        if not detail_error and pred_detail:
-            # Проверяем, изменился ли статус предсказания с последней проверки
-            current_status = pred_detail.get('status')
-            previous_status = pred.get('status')
+        if detail_error or not pred_detail:
+            continue
             
-            if current_status != previous_status:
-                return True  # Статус изменился, нужно обновить страницу
+        # Получаем актуальный статус
+        actual_status = pred_detail.get('status')
+        previous_status = pred.get('status')
+        
+        # Подсчитываем реальные pending предсказания
+        if actual_status == 'pending':
+            actual_pending_count += 1
+            
+        # Проверяем, изменился ли статус
+        if actual_status != previous_status:
+            status_changed = True
     
-    # Автоматически обновляем страницу, если есть pending предсказания (даже без изменений)
-    if pending_count > 0:
+    # Отображаем информацию о pending предсказаниях с актуальным счетчиком
+    if actual_pending_count > 0:
+        st.info(f"You have {actual_pending_count} pending prediction(s). Auto-refreshing is {'enabled' if st.session_state.auto_refresh_enabled else 'disabled'}.")
+    
+    # Обновляем страницу, если:
+    # 1. Статус какого-либо предсказания изменился
+    # 2. Есть активные pending предсказания и auto-refresh включен
+    if status_changed or (actual_pending_count > 0 and st.session_state.auto_refresh_enabled):
         return True
         
     return False
