@@ -19,6 +19,12 @@ if 'password' not in st.session_state:
     st.session_state.password = ""
 if 'input_method' not in st.session_state:
     st.session_state.input_method = "Manual Input" # Значение по умолчанию
+if 'prediction_status_check' not in st.session_state:
+    st.session_state.prediction_status_check = {}
+if 'last_status_check_time' not in st.session_state:
+    st.session_state.last_status_check_time = datetime.now()
+if 'auto_refresh_enabled' not in st.session_state:
+    st.session_state.auto_refresh_enabled = True
 
 # --- Вспомогательная функция ---
 def make_request(method, endpoint, data=None, auth=None, files=None):
@@ -74,6 +80,9 @@ def logout():
     st.session_state.password = ""
     st.session_state.page = "login"
     st.session_state.input_method = "Manual Input" # Сброс при выходе
+    st.session_state.prediction_status_check = {}
+    st.session_state.last_status_check_time = datetime.now()
+    st.session_state.auto_refresh_enabled = True
     st.rerun()
 
 def check_balance(required_amount):
@@ -87,6 +96,41 @@ def check_balance(required_amount):
         st.error("Invalid balance format received from API.")
         return False
 
+def check_pending_predictions(auth):
+    """Проверяет статус предсказаний, которые находятся в состоянии 'pending'."""
+    # Получаем текущее время
+    current_time = datetime.now()
+    
+    # Проверяем, прошло ли достаточно времени с последней проверки (10 секунд)
+    time_since_last_check = (current_time - st.session_state.last_status_check_time).total_seconds()
+    if time_since_last_check < 10:
+        return False  # Еще не прошло 10 секунд с последней проверки
+    
+    # Обновляем время последней проверки
+    st.session_state.last_status_check_time = current_time
+    
+    # Получаем историю предсказаний
+    predictions_response, error = make_request("GET", "/predictions", auth=auth)
+    if error or not predictions_response:
+        return False
+    
+    # Проверяем, есть ли предсказания в состоянии 'pending'
+    has_pending = False
+    status_changed = False
+    
+    for pred in predictions_response:
+        if pred.get('status') == 'pending':
+            has_pending = True
+            pred_id = pred.get('id')
+            
+            # Проверяем статус для этого предсказания
+            pred_detail, detail_error = make_request("GET", f"/predict/{pred_id}", auth=auth)
+            if not detail_error and pred_detail:
+                current_status = pred_detail.get('status')
+                if current_status != 'pending':
+                    status_changed = True  # Статус изменился
+                    
+    return has_pending and status_changed
 
 # --- Страницы ---
 def login_page():
@@ -170,8 +214,14 @@ def dashboard_page():
         return
 
     auth = (st.session_state.user['username'], st.session_state.password)
+    
+    # Автоматическая проверка статуса предсказаний
+    if st.session_state.auto_refresh_enabled:
+        if check_pending_predictions(auth):
+            # Если статус изменился, перезагружаем страницу
+            st.rerun()
 
-    col1, col2 = st.columns([4, 1])
+    col1, col2, col3 = st.columns([3, 1, 1])
     with col1:
         st.write(f"Welcome, {st.session_state.user.get('firstname', 'User')}!")
         try:
@@ -181,6 +231,14 @@ def dashboard_page():
              st.write(f"Your balance: Invalid format ({st.session_state.user['balance']})")
 
     with col2:
+        # Добавляем переключатель для автоматического обновления
+        auto_refresh = st.checkbox("Auto refresh", value=st.session_state.auto_refresh_enabled,
+                                  help="Automatically check prediction status every 10 seconds")
+        if auto_refresh != st.session_state.auto_refresh_enabled:
+            st.session_state.auto_refresh_enabled = auto_refresh
+            st.session_state.last_status_check_time = datetime.now()
+    
+    with col3:
         if st.button("Logout"):
             logout()
             return
@@ -244,6 +302,7 @@ def dashboard_page():
     except Exception as e:
          st.error(f"Could not provide sample CSV: {e}")
 
+    # Выбор способа ввода данных
     st.radio(
         "Choose input method:",
         ["Manual Input", "Upload CSV"],
@@ -321,6 +380,7 @@ def dashboard_page():
                         st.error("The uploaded CSV file is empty or contains no data rows.")
                         input_data_from_csv_list = None
                     else:
+                        # Используем только требуемые колонки
                         input_data_from_csv_list = df[required_columns].to_dict('records')
                         num_rows_in_csv = len(input_data_from_csv_list)
                         st.success(f"CSV file loaded successfully! Found {num_rows_in_csv} data rows.")
@@ -415,15 +475,19 @@ def dashboard_page():
                             except (ValueError, TypeError, KeyError):
                                 st.warning("Could not update balance display locally.")
 
-                            # Здесь отображаем предсказания
-                            if isinstance(response, dict):
-                                st.success("Prediction completed successfully!")
-                                st.json(response)
-                            elif isinstance(response, str):
-                                st.success("Prediction completed successfully!")
-                                st.text_area("Prediction Result (raw text):", response, height=300)
+                            # Получаем ID предсказания
+                            prediction_id = response.get("prediction_id")
+                            if prediction_id:
+                                # Добавляем в список для автоматической проверки статуса
+                                st.session_state.prediction_status_check[prediction_id] = {
+                                    "checked": False,
+                                    "model_id": model_id,
+                                    "model_name": selected_model['name']
+                                }
+                                st.success(f"Prediction request submitted successfully! ID: {prediction_id}")
+                                st.info("Your prediction is being processed. You can check the status in the Prediction History section.")
                             else:
-                                st.warning("Received unexpected response format.")
+                                st.warning("Prediction request accepted but no ID was returned.")
 
                             st.rerun()  # Обновить баланс и историю
                         else:
@@ -452,6 +516,16 @@ def dashboard_page():
         if not sorted_predictions:
              st.info("No prediction records found.")
         else:
+            # Проверяем наличие предсказаний в статусе pending
+            pending_count = sum(1 for p in sorted_predictions if p.get('status') == 'pending')
+            if pending_count > 0:
+                st.info(f"You have {pending_count} pending prediction(s). {'Auto-refreshing is enabled.' if st.session_state.auto_refresh_enabled else 'Enable auto-refresh for automatic updates.'}")
+            
+            # Добавляем кнопку для ручного обновления
+            if st.button("Refresh Predictions"):
+                st.session_state.last_status_check_time = datetime.now() - datetime.timedelta(seconds=11)  # Форсируем проверку
+                st.rerun()
+            
             for pred in sorted_predictions[:10]:
                 pred_id = pred.get('id', 'N/A')
                 status = pred.get('status', 'Unknown').capitalize()
@@ -476,6 +550,24 @@ def dashboard_page():
                 expander_title = f"🔮 ID: {pred_id} | Status: :{status_color}[{status}] | Model: {model_name} | Time: {created_at_str}"
 
                 with st.expander(expander_title, expanded=False):
+                    if status == "Pending":
+                        st.info("This prediction is still being processed. Please wait or refresh the page to check for updates.")
+                        st.progress(0.5, text="Processing...")
+                        if st.button("Check Status", key=f"check_status_{pred_id}"):
+                            with st.spinner(f"Checking status for prediction {pred_id}..."):
+                                pred_detail, detail_error = make_request("GET", f"/predict/{pred_id}", auth=auth)
+                                if detail_error:
+                                    st.error(f"Could not check status for prediction {pred_id}.")
+                                elif pred_detail:
+                                    updated_status = pred_detail.get('status', 'Unknown')
+                                    if updated_status != 'pending':
+                                        st.success(f"Status updated to: {updated_status.capitalize()}")
+                                        st.rerun()  # Обновляем страницу для отображения нового статуса
+                                    else:
+                                        st.info("Prediction is still being processed.")
+                                else:
+                                    st.warning("Received no details for this prediction.")
+                    
                     if st.button("View Details", key=f"view_detail_{pred_id}"):
                         with st.spinner(f"Loading details for prediction {pred_id}..."):
                             full_pred, detail_error = make_request("GET", f"/predict/{pred_id}", auth=auth)
@@ -493,12 +585,53 @@ def dashboard_page():
 
                                 st.write("**Output Data:**")
                                 output_data_display = full_pred.get("output_data", "Not available or prediction not finished")
-                                if isinstance(output_data_display, list) and len(output_data_display) > 5:
-                                     st.json(output_data_display[:5])
-                                     st.write(f"... and {len(output_data_display) - 5} more items. Full data available in raw JSON.")
-                                else:
-                                     st.json(output_data_display)
-
+                                
+                                # Проверяем, завершено ли предсказание и есть ли accuracy
+                                if full_pred.get('status') == 'completed' and isinstance(output_data_display, dict):
+                                    # Проверяем, есть ли информация о точности
+                                    if 'accuracy' in output_data_display:
+                                        accuracy = output_data_display.get('accuracy', 0)
+                                        st.metric("Prediction Accuracy", f"{accuracy:.2%}")
+                                    
+                                    # Отображаем предсказания
+                                    if 'predictions' in output_data_display:
+                                        predictions = output_data_display.get('predictions', [])
+                                        if predictions:
+                                            st.write("**Prediction Results:**")
+                                            if len(predictions) > 5:
+                                                st.write(f"Showing first 5 of {len(predictions)} predictions:")
+                                                st.write(predictions[:5])
+                                                st.write("...")
+                                            else:
+                                                st.write(predictions)
+                                    
+                                    # Проверяем, есть ли ссылка на скачивание CSV
+                                    if 'csv_download_url' in full_pred:
+                                        download_url = full_pred.get('csv_download_url')
+                                        csv_url = f"{API_BASE_URL}{download_url}"
+                                        
+                                        # Создаем кнопку для скачивания через API
+                                        if st.button("Download Prediction Results CSV", key=f"download_csv_{pred_id}"):
+                                            with st.spinner("Preparing CSV download..."):
+                                                # Выполняем запрос для получения CSV файла
+                                                response = requests.get(csv_url, auth=auth)
+                                                if response.status_code == 200:
+                                                    # Подготавливаем данные для скачивания
+                                                    csv_data = response.content
+                                                    st.download_button(
+                                                        label="Save CSV File",
+                                                        data=csv_data,
+                                                        file_name=f"prediction_{pred_id}.csv",
+                                                        mime="text/csv",
+                                                        key=f"save_csv_{pred_id}"
+                                                    )
+                                                else:
+                                                    st.error(f"Failed to download CSV: {response.status_code}")
+                                
+                                # Отображаем вывод в JSON формате
+                                st.write("**Raw Output Data:**")
+                                st.json(output_data_display)
+                                
                                 st.write("**Full Details (Raw JSON):**")
                                 st.json(full_pred)
                             else:

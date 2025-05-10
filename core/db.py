@@ -195,3 +195,49 @@ async def get_predictions_by_user(user_id):
         return predictions
     finally:
         await db.close()
+
+
+async def update_prediction(prediction_id: str, status: str, output_data=None):
+    """
+    Обновляет статус и результаты предсказания.
+    
+    Args:
+        prediction_id: Идентификатор предсказания
+        status: Новый статус (completed, failed, etc.)
+        output_data: JSON строка с результатами предсказания или None
+    
+    Returns:
+        bool: True если обновление прошло успешно, иначе False
+    """
+    db = await get_db()
+    try:
+        now = datetime.utcnow().isoformat()
+        
+        if output_data is not None:
+            # Обновляем и статус и результаты
+            await db.execute(
+                """
+                UPDATE predictions 
+                SET status = ?, output_data = ?, updated_at = ? 
+                WHERE id = ?
+                """,
+                (status, output_data, now, prediction_id)
+            )
+        else:
+            # Обновляем только статус
+            await db.execute(
+                """
+                UPDATE predictions 
+                SET status = ?, updated_at = ? 
+                WHERE id = ?
+                """,
+                (status, now, prediction_id)
+            )
+            
+        await db.commit()
+        return True
+    except Exception as e:
+        print(f"Error updating prediction: {e}")
+        return False
+    finally:
+        await db.close()

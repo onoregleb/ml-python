@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, status, Body
+from fastapi import FastAPI, HTTPException, Depends, status, Body, BackgroundTasks
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 from core.dto.CreateAccountDto import CreateAccountDto
@@ -6,7 +6,7 @@ from core.dto.CreatePredictionDto import CreatePredictionDto
 from core.db import (
     init_db, create_user, get_user_by_username, get_account_by_user_id,
     add_balance, subtract_balance, get_models, create_model, get_model_by_id,
-    create_prediction, get_prediction_by_id, get_predictions_by_user
+    create_prediction, get_prediction_by_id, get_predictions_by_user, update_prediction
 )
 import asyncio
 import joblib
@@ -16,6 +16,9 @@ import logging
 from fastapi.responses import StreamingResponse
 import io
 import json
+import random
+import time
+import threading
 from contextlib import asynccontextmanager
 
 @asynccontextmanager
@@ -53,6 +56,83 @@ logger = logging.getLogger(__name__)
 security = HTTPBasic()
 LOADED_MODELS = {}
 app = FastAPI(lifespan=lifespan)
+
+# Функция для обработки предсказаний в фоновом режиме
+def process_prediction_task(prediction_id, model_key, input_data_list):
+    """Обрабатывает предсказание в фоновом режиме с задержкой."""
+    logger.info(f"Starting background task for prediction {prediction_id} with model {model_key}")
+    
+    try:
+        # Добавляем случайную задержку от 10 до 25 секунд
+        delay_time = random.uniform(10, 25)
+        logger.info(f"Adding random delay of {delay_time:.2f} seconds for prediction {prediction_id}")
+        time.sleep(delay_time)
+        
+        # Загружаем модель
+        loaded_model = LOADED_MODELS.get(model_key)
+        if loaded_model is None:
+            logger.error(f"ML model not loaded for key: {model_key}")
+            asyncio.run(update_prediction(
+                prediction_id, 
+                "failed", 
+                json.dumps({"error": f"Model '{model_key}' not found"})
+            ))
+            return
+        
+        # Подготовка данных
+        expected_columns = ['feature_0', 'feature_1', 'feature_2', 'feature_3', 'feature_4']
+        X_pred = pd.DataFrame(input_data_list)
+        
+        # Проверяем наличие нужных колонок
+        if not all(col in X_pred.columns for col in expected_columns):
+            missing = [col for col in expected_columns if col not in X_pred.columns]
+            logger.error(f"Input data missing expected columns: {missing}")
+            asyncio.run(update_prediction(
+                prediction_id, 
+                "failed", 
+                json.dumps({"error": f"Missing columns: {missing}"})
+            ))
+            return
+            
+        # Подготовка данных для предсказания
+        X_pred = X_pred[expected_columns]
+        X_pred = X_pred.astype(float)
+        
+        # Делаем предсказание
+        y_pred = loaded_model.predict(X_pred)
+        output_list = y_pred.tolist()
+        
+        # Создаем CSV с результатами
+        response_df = X_pred.copy()
+        response_df['target'] = output_list
+        csv_buffer = io.StringIO()
+        response_df.to_csv(csv_buffer, index=False)
+        csv_content = csv_buffer.getvalue()
+        
+        # Рассчитываем точность (для примера)
+        accuracy = random.uniform(0.75, 0.99)  # Симуляция точности
+        
+        # Обновляем запись в БД
+        asyncio.run(update_prediction(
+            prediction_id=prediction_id,
+            status="completed",
+            output_data=json.dumps({
+                "predictions": output_list,
+                "accuracy": accuracy,
+                "csv_content": csv_content
+            })
+        ))
+        
+        logger.info(f"Prediction {prediction_id} completed successfully with accuracy {accuracy:.4f}")
+        
+    except Exception as e:
+        logger.error(f"Prediction task failed: {e}", exc_info=True)
+        # При ошибке обновляем статус предсказания
+        asyncio.run(update_prediction(
+            prediction_id, 
+            "failed", 
+            json.dumps({"error": str(e)})
+        ))
 
 async def get_current_user(credentials: HTTPBasicCredentials = Depends(security)):
     user = await get_user_by_username(credentials.username)
@@ -99,6 +179,7 @@ async def get_models_endpoint():
 
 @app.post("/predict")
 async def create_prediction_endpoint(
+    background_tasks: BackgroundTasks,
     prediction_data: CreatePredictionDto = Body(...),
     user = Depends(get_current_user)
 ):
@@ -128,150 +209,90 @@ async def create_prediction_endpoint(
         logger.warning(f"Insufficient balance for user {user['id']}. Needed: {required_cost}, Have: {account['balance'] if account else 0}")
         raise HTTPException(status_code=400, detail="Insufficient balance")
 
-    # 3) Загрузка ML модели в память
-    # Исправлено: используем file_name, если он есть, иначе model['name'] или model['id'] как ключ
-    model_key = model.get("file_name") # .get() безопаснее
+    # 3) Определяем ключ модели
+    model_key = model.get("file_name")
     if not model_key:
-        # Пытаемся найти по имени или ID, если file_name нет
         if model['name'] == "Risk Assessment Model": model_key = "lr"
         elif model['name'] == "Return Prediction Model": model_key = "rf"
         elif model['name'] == "Premium Analysis Model": model_key = "cb"
-        else: model_key = model['id'] # Fallback
-    logger.info(f"Attempting to load ML model with key: {model_key}")
+        else: model_key = model['id']
+    logger.info(f"Using ML model with key: {model_key}")
 
-    loaded_model = LOADED_MODELS.get(model_key)
-    if loaded_model is None:
+    # 4) Проверяем, что модель доступна
+    if model_key not in LOADED_MODELS:
         logger.error(f"ML model not loaded for key: {model_key}. Available keys: {list(LOADED_MODELS.keys())}")
-        # Дополнительная проверка: существует ли модель в БД, но не загружена?
-        db_models = await get_models()
-        db_model_keys = [m.get('file_name', m['id']) for m in db_models]
-        logger.error(f"Model keys found in DB: {db_model_keys}")
-        raise HTTPException(status_code=500, detail=f"ML model associated with key '{model_key}' not loaded on server.")
+        raise HTTPException(status_code=500, detail=f"ML model '{model_key}' not available")
 
-    # 4) Подготовка данных
-    expected_columns = ['feature_0', 'feature_1', 'feature_2', 'feature_3', 'feature_4']
+    # 5) Подготовка данных
     try:
         # Гарантируем, что input_data_list будет списком для единообразия
         if isinstance(prediction_data.input_data, list):
             input_data_list = prediction_data.input_data
         else:
-            input_data_list = [prediction_data.input_data] # Оборачиваем одиночный объект в список
+            input_data_list = [prediction_data.input_data]
 
-        if not input_data_list: # Проверка на пустой список
+        if not input_data_list:
              raise ValueError("Input data list cannot be empty.")
 
-        X_pred = pd.DataFrame(input_data_list)
+        # Проверяем наличие необходимых колонок
+        expected_columns = ['feature_0', 'feature_1', 'feature_2', 'feature_3', 'feature_4']
+        sample_df = pd.DataFrame(input_data_list)
+        if not all(col in sample_df.columns for col in expected_columns):
+            missing = [col for col in expected_columns if col not in sample_df.columns]
+            logger.error(f"Input data missing expected columns: {missing}")
+            raise HTTPException(status_code=400, 
+                              detail=f"Input data missing expected columns: {missing}")
 
-        # Проверка наличия колонок
-        if not all(col in X_pred.columns for col in expected_columns):
-            missing = [col for col in expected_columns if col not in X_pred.columns]
-            logger.error(f"Input data missing expected columns: {missing}. Available columns: {list(X_pred.columns)}")
-            raise HTTPException(status_code=400,
-                                detail=f"Input data missing expected columns: {missing}. Required: {expected_columns}")
-
-        # Убедимся, что колонки идут в нужном порядке и имеют правильный тип
-        X_pred = X_pred[expected_columns]
-        logger.info(f"DataFrame shape for prediction: {X_pred.shape}")
-        # Попытка конвертации в float с логированием проблем
-        try:
-            X_pred = X_pred.astype(float)
-        except ValueError as e:
-             logger.error(f"Error converting input data to float: {e}. Check input data format.")
-             # Попробуем найти проблемную колонку/значение (упрощенно)
-             for col in expected_columns:
-                 try:
-                     X_pred[col].astype(float)
-                 except ValueError:
-                     logger.error(f"Problem likely in column '{col}'. First few values: {X_pred[col].head().tolist()}")
-                     break
-             raise HTTPException(status_code=400, detail=f"Invalid numeric format in input data: {e}")
-
-    except KeyError as e:
-        logger.error(f"Input data structure error, missing key: {e}")
-        raise HTTPException(status_code=400, detail=f"Input data structure error, missing key: {e}. Required keys in each object: {expected_columns}")
-    except ValueError as e: # Ловим ошибки типа пустых данных или неверной структуры
-         logger.error(f"Data preparation error: {e}")
-         raise HTTPException(status_code=400, detail=f"Error preparing data: {e}")
     except Exception as e:
-        logger.error(f"Unexpected error preparing DataFrame: {e}", exc_info=True)
-        raise HTTPException(status_code=400, detail=f"Error preparing data for prediction: {e}")
+        logger.error(f"Error preparing data: {e}", exc_info=True)
+        raise HTTPException(status_code=400, detail=f"Error preparing data: {e}")
 
-    # 5) Предсказание
-    try:
-        y_pred = loaded_model.predict(X_pred)
-        output_list = y_pred.tolist() # Конвертируем numpy array в Python list
-        logger.info(f"Prediction successful. Number of predictions: {len(output_list)}")
-        # Логируем пример вывода
-        if output_list:
-            logger.info(f"Prediction output sample: {output_list[:5]}")
-    except Exception as e:
-        logger.error(f"Prediction failed during model.predict(): {e}", exc_info=True)
-        # Возможно, стоит вернуть деньги или не списывать их, если предсказание упало?
-        # Пока что просто возвращаем ошибку.
-        raise HTTPException(status_code=500, detail=f"Prediction error: {e}") # 500 т.к. проблема на сервере
-
-    # 6) Вычитаем баланс *после* успешного предсказания
+    # 6) Списываем баланс
     try:
         await subtract_balance(user["id"], required_cost)
         logger.info(f"Balance {required_cost:.2f} subtracted from user {user['id']}")
     except Exception as e:
-        # Что делать если списание не удалось? Предсказание уже сделано.
-        # Можно попробовать "откатить" или просто залогировать серьезную ошибку.
-        logger.error(f"CRITICAL: Failed to subtract balance for user {user['id']} after successful prediction! Error: {e}", exc_info=True)
-        # Решаем не прерывать процесс, но логируем
-        # raise HTTPException(status_code=500, detail="Failed to update balance after prediction.")
+        logger.error(f"Failed to subtract balance: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to update balance")
 
-    # 7) Сохраняем ОДНУ запись предсказания в БД со ВСЕМИ входами и выходами
+    # 7) Создаем запись предсказания со статусом "pending"
     try:
-        # Сериализуем весь список входов и весь список выходов в JSON строки
         input_data_json = json.dumps(input_data_list)
-        output_data_json = json.dumps(output_list)
-
-        # Вызываем функцию создания предсказания ОДИН РАЗ
         prediction_id = await create_prediction(
             model_id=prediction_data.model_id,
             user_id=user["id"],
-            input_data=input_data_json,    # Сохраняем JSON строку списка входов
-            output_data=output_data_json,  # Сохраняем JSON строку списка выходов
-            # Статус можно установить здесь или внутри create_prediction
-            status="completed" # Явно указываем статус
+            input_data=input_data_json,
+            output_data=None,  # Пока нет данных
+            status="pending"   # Статус "pending"
         )
-        logger.info(f"Successfully saved prediction record with ID: {prediction_id} containing {len(input_data_list)} inputs/outputs.")
+        logger.info(f"Created prediction record with ID: {prediction_id}")
+    except Exception as e:
+        logger.error(f"Failed to create prediction record: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to create prediction record")
 
-    except Exception as db_err:
-        logger.error(f"Database error while saving prediction bundle: {db_err}", exc_info=True)
-        # Если запись в БД не удалась, баланс уже списан. Это проблема.
-        # Возможно, стоит добавить логику компенсации или пометки записи как ошибочной.
-        raise HTTPException(status_code=500, detail="Failed to save prediction results to database")
-
-    # 8) Подготовка CSV файла для ответа (остается без изменений)
+    # 8) Запускаем фоновую задачу для обработки предсказания
     try:
-        # Убедимся, что длины совпадают перед созданием DataFrame для CSV
-        if len(X_pred) != len(output_list):
-            logger.error(f"CRITICAL: Mismatch between input count ({len(X_pred)}) and output count ({len(output_list)}) before CSV generation.")
-            # Эта ошибка не должна произойти, если predict не вызвал исключение, но проверим
-            raise HTTPException(status_code=500, detail="Internal error: Input and output count mismatch.")
+        # Создаем отдельный поток для обработки предсказания
+        thread = threading.Thread(
+            target=process_prediction_task,
+            args=(prediction_id, model_key, input_data_list)
+        )
+        thread.daemon = True  # Поток завершится автоматически при завершении основного процесса
+        thread.start()
+        
+        logger.info(f"Started background thread for prediction {prediction_id}")
+    except Exception as e:
+        logger.error(f"Failed to start background task: {e}", exc_info=True)
+        # Обновляем статус предсказания на "failed"
+        await update_prediction(prediction_id, "failed", json.dumps({"error": str(e)}))
+        raise HTTPException(status_code=500, detail="Failed to start prediction task")
 
-        # Используем исходный DataFrame X_pred (он содержит все входные фичи)
-        # Копируем, чтобы не изменять X_pred, если он еще где-то нужен
-        response_df = X_pred.copy()
-        response_df['target'] = output_list # Добавляем колонку с предсказаниями
-
-        buffer = io.StringIO()
-        response_df.to_csv(buffer, index=False)
-        buffer.seek(0)
-        logger.info(f"Successfully prepared CSV response buffer for prediction {prediction_id}.")
-
-        response = StreamingResponse(iter([buffer.getvalue()]), media_type="text/csv")
-        response.headers["Content-Disposition"] = f"attachment; filename=predictions_{prediction_id}.csv" # Добавим ID в имя файла
-        # Можно добавить ID предсказания в заголовок ответа для удобства клиента
-        response.headers["X-Prediction-ID"] = str(prediction_id)
-
-        return response
-
-    except Exception as csv_prep_err:
-        logger.error(f"Error preparing CSV response for prediction {prediction_id}: {csv_prep_err}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to generate CSV response: {csv_prep_err}")
+    # 9) Возвращаем ID предсказания клиенту
+    return {
+        "prediction_id": prediction_id,
+        "status": "pending",
+        "message": "Prediction queued for processing"
+    }
 
 
 @app.get("/predict/{prediction_id}")
@@ -289,15 +310,57 @@ async def get_prediction_endpoint(prediction_id: str, user = Depends(get_current
     input_data = json.loads(prediction["input_data"]) if prediction["input_data"] else None
     output_data = json.loads(prediction["output_data"]) if prediction["output_data"] else None
 
-    return {
-        "id": prediction["id"],
-        "model_id": prediction["model_id"],
-        "status": prediction["status"],
-        "input_data": input_data,
-        "output_data": output_data,
-        "created_at": prediction["created_at"],
-        "updated_at": prediction["updated_at"]
-    }
+    # Если статус "completed" и есть output_data, предоставляем возможность скачать CSV
+    if prediction["status"] == "completed" and output_data and "csv_content" in output_data:
+        response = {
+            "id": prediction["id"],
+            "model_id": prediction["model_id"],
+            "status": prediction["status"],
+            "input_data": input_data,
+            "output_data": {
+                "predictions": output_data.get("predictions", []),
+                "accuracy": output_data.get("accuracy", 0.0)
+            },
+            "created_at": prediction["created_at"],
+            "updated_at": prediction["updated_at"],
+            "csv_download_url": f"/predict/{prediction_id}/download"
+        }
+    else:
+        response = {
+            "id": prediction["id"],
+            "model_id": prediction["model_id"],
+            "status": prediction["status"],
+            "input_data": input_data,
+            "output_data": output_data,
+            "created_at": prediction["created_at"],
+            "updated_at": prediction["updated_at"]
+        }
+    
+    return response
+
+
+@app.get("/predict/{prediction_id}/download")
+async def download_prediction_csv(prediction_id: str, user = Depends(get_current_user)):
+    logger.info(f"Download CSV for prediction {prediction_id} requested by user {user['id']}")
+    prediction = await get_prediction_by_id(prediction_id)
+    
+    if not prediction:
+        raise HTTPException(status_code=404, detail="Prediction not found")
+    if prediction["user_id"] != user["id"]:
+        raise HTTPException(status_code=403, detail="Not authorized to download this prediction")
+    if prediction["status"] != "completed":
+        raise HTTPException(status_code=400, detail="Prediction not completed yet")
+    
+    output_data = json.loads(prediction["output_data"]) if prediction["output_data"] else None
+    if not output_data or "csv_content" not in output_data:
+        raise HTTPException(status_code=404, detail="CSV data not available for this prediction")
+    
+    # Создаем StreamingResponse из CSV контента
+    buffer = io.StringIO(output_data["csv_content"])
+    response = StreamingResponse(iter([buffer.getvalue()]), media_type="text/csv")
+    response.headers["Content-Disposition"] = f"attachment; filename=predictions_{prediction_id}.csv"
+    
+    return response
 
 
 class TopUpDto(BaseModel):
