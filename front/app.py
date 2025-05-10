@@ -1,7 +1,7 @@
 import streamlit as st
 import requests
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 import pandas as pd
 import io
 
@@ -28,7 +28,19 @@ if 'auto_refresh_enabled' not in st.session_state:
 
 # --- Вспомогательная функция ---
 def make_request(method, endpoint, data=None, auth=None, files=None):
-    """Отправляет запрос к API и обрабатывает ответ."""
+    """
+    Отправляет запрос к API и обрабатывает ответ.
+    
+    Args:
+        method (str): HTTP метод запроса (GET, POST, и т.д.)
+        endpoint (str): Эндпоинт API
+        data (dict, optional): Данные для отправки в формате JSON
+        auth (tuple, optional): Аутентификационные данные (username, password)
+        files (dict, optional): Файлы для отправки
+        
+    Returns:
+        tuple: (данные ответа, сообщение об ошибке)
+    """
     url = f"{API_BASE_URL}{endpoint}"
     try:
         headers = {}
@@ -45,7 +57,7 @@ def make_request(method, endpoint, data=None, auth=None, files=None):
             return None, "Invalid HTTP method specified"
 
         # Обработка кодов состояния
-        if response.status_code == 200:
+        if response.status_code in [200, 201]:
             content_type = response.headers.get("Content-Type", "")
             if "application/json" in content_type:
                 try:
@@ -74,7 +86,12 @@ def make_request(method, endpoint, data=None, auth=None, files=None):
 
 # --- Функции управления сессией ---
 def logout():
-    """Сбрасывает состояние сессии для выхода пользователя."""
+    """
+    Сбрасывает состояние сессии для выхода пользователя.
+    
+    Очищает все данные пользователя и сбрасывает настройки приложения 
+    к значениям по умолчанию, затем перезагружает страницу.
+    """
     st.session_state.logged_in = False
     st.session_state.user = None
     st.session_state.password = ""
@@ -86,7 +103,15 @@ def logout():
     st.rerun()
 
 def check_balance(required_amount):
-    """Проверяет, достаточно ли средств на балансе пользователя."""
+    """
+    Проверяет, достаточно ли средств на балансе пользователя.
+    
+    Args:
+        required_amount (float): Необходимая сумма средств
+        
+    Returns:
+        bool: True, если на балансе достаточно средств, иначе False
+    """
     if not st.session_state.user or 'balance' not in st.session_state.user:
         return False
     try:
@@ -97,7 +122,21 @@ def check_balance(required_amount):
         return False
 
 def check_pending_predictions(auth):
-    """Проверяет статус предсказаний, которые находятся в состоянии 'pending'."""
+    """
+    Проверяет статус предсказаний и обновляет страницу при наличии изменений.
+    
+    Функция вызывается автоматически при включенном auto-refresh и выполняет:
+    1. Проверку времени с последнего обновления (не чаще 10 секунд)
+    2. Подсчет количества ожидающих (pending) предсказаний
+    3. Отображение информационного сообщения о статусе предсказаний
+    4. Проверку изменений статуса для всех предсказаний
+    
+    Args:
+        auth (tuple): Аутентификационные данные пользователя (username, password)
+        
+    Returns:
+        bool: True, если нужно обновить страницу, иначе False
+    """
     # Получаем текущее время
     current_time = datetime.now()
     
@@ -114,27 +153,45 @@ def check_pending_predictions(auth):
     if error or not predictions_response:
         return False
     
-    # Проверяем, есть ли предсказания в состоянии 'pending'
-    has_pending = False
-    status_changed = False
+    # Проверяем наличие предсказаний и считаем сколько из них в статусе 'pending'
+    pending_count = sum(1 for pred in predictions_response if pred.get('status') == 'pending')
     
+    # Отображаем информацию о pending предсказаниях
+    if pending_count > 0:
+        st.info(f"You have {pending_count} pending prediction(s). Auto-refreshing is {'enabled' if st.session_state.auto_refresh_enabled else 'disabled'}.")
+    
+    # Проверяем каждое предсказание на изменение статуса
     for pred in predictions_response:
-        if pred.get('status') == 'pending':
-            has_pending = True
-            pred_id = pred.get('id')
+        pred_id = pred.get('id')
+        if not pred_id:
+            continue
             
-            # Проверяем статус для этого предсказания
-            pred_detail, detail_error = make_request("GET", f"/predict/{pred_id}", auth=auth)
-            if not detail_error and pred_detail:
-                current_status = pred_detail.get('status')
-                if current_status != 'pending':
-                    status_changed = True  # Статус изменился
-                    
-    return has_pending and status_changed
+        # Проверяем статус для этого предсказания
+        pred_detail, detail_error = make_request("GET", f"/predict/{pred_id}", auth=auth)
+        if not detail_error and pred_detail:
+            # Проверяем, изменился ли статус предсказания с последней проверки
+            current_status = pred_detail.get('status')
+            previous_status = pred.get('status')
+            
+            if current_status != previous_status:
+                return True  # Статус изменился, нужно обновить страницу
+    
+    # Автоматически обновляем страницу, если есть pending предсказания (даже без изменений)
+    if pending_count > 0:
+        return True
+        
+    return False
 
 # --- Страницы ---
 def login_page():
-    """Страница входа пользователя."""
+    """
+    Страница входа пользователя.
+    
+    Отображает форму для ввода логина и пароля, обрабатывает
+    аутентификацию пользователя и переходит на главную страницу
+    при успешном входе. Также предоставляет кнопку для перехода
+    на страницу регистрации.
+    """
     st.title("ML Service Login")
 
     username = st.text_input("Username")
@@ -167,7 +224,14 @@ def login_page():
             st.rerun()
 
 def register_page():
-    """Страница регистрации нового пользователя."""
+    """
+    Страница регистрации нового пользователя.
+    
+    Отображает форму для создания нового аккаунта, включающую
+    ввод логина, пароля, имени и подтверждения пароля.
+    При успешной регистрации автоматически выполняет вход
+    и переходит в основное приложение.
+    """
     st.title("Register New Account")
 
     firstname = st.text_input("First Name")
@@ -205,7 +269,20 @@ def register_page():
             st.rerun()
 
 def dashboard_page():
-    """Главная страница приложения после входа."""
+    """
+    Главная страница приложения после входа.
+    
+    Отображает:
+    1. Информацию о пользователе и балансе
+    2. Элементы управления (auto-refresh, выход)
+    3. Панель пополнения баланса
+    4. Список доступных моделей
+    5. Формы для создания предсказаний
+    6. Историю предсказаний пользователя с детальной информацией
+    
+    Обеспечивает полную функциональность взаимодействия с ML-сервисом,
+    включая создание новых предсказаний и просмотр результатов.
+    """
     st.title("ML Service Dashboard")
 
     if not st.session_state.user or not st.session_state.password or 'username' not in st.session_state.user or 'balance' not in st.session_state.user:
@@ -523,7 +600,7 @@ def dashboard_page():
             
             # Добавляем кнопку для ручного обновления
             if st.button("Refresh Predictions"):
-                st.session_state.last_status_check_time = datetime.now() - datetime.timedelta(seconds=11)  # Форсируем проверку
+                st.session_state.last_status_check_time = datetime.now() - timedelta(seconds=11)  # Форсируем проверку
                 st.rerun()
             
             for pred in sorted_predictions[:10]:
@@ -640,7 +717,14 @@ def dashboard_page():
 
 # --- Основная логика приложения ---
 def main():
-    """Определяет, какую страницу показать."""
+    """
+    Определяет, какую страницу показать пользователю.
+    
+    Основная функция приложения, которая управляет маршрутизацией
+    между страницами на основе состояния сессии. Если пользователь
+    авторизован, показывает dashboard_page, иначе - страницу входа
+    или регистрации в зависимости от выбора пользователя.
+    """
     if st.session_state.logged_in and st.session_state.user:
         dashboard_page()
     else:

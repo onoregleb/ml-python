@@ -1,3 +1,11 @@
+"""
+Модуль для взаимодействия с базой данных SQLite.
+
+Данный модуль предоставляет функции для создания и управления базой данных приложения.
+Включает функции для работы с пользователями, аккаунтами, моделями и предсказаниями.
+Все функции являются асинхронными для эффективной работы с FastAPI.
+"""
+
 import aiosqlite
 from config.settings import DB_PATH
 from datetime import datetime
@@ -5,6 +13,18 @@ import uuid
 import json
 
 async def init_db():
+    """
+    Инициализирует базу данных, создавая необходимые таблицы, если они еще не существуют.
+    
+    Создает таблицы:
+    - users: для хранения данных пользователей
+    - accounts: для хранения баланса пользователей
+    - models: для хранения информации о моделях машинного обучения
+    - predictions: для хранения данных о предсказаниях
+    
+    Returns:
+        None
+    """
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript("""
         CREATE TABLE IF NOT EXISTS users (
@@ -44,12 +64,33 @@ async def init_db():
 
 
 async def get_db():
+    """
+    Создает и возвращает соединение с базой данных.
+    
+    Устанавливает row_factory, чтобы результаты запросов возвращались в виде словарей.
+    
+    Returns:
+        aiosqlite.Connection: Соединение с базой данных
+    """
     db = await aiosqlite.connect(DB_PATH)
     db.row_factory = aiosqlite.Row  # чтобы получать строки в виде dict
     return db
 
 
 async def create_user(firstname, username, password):
+    """
+    Создает нового пользователя в базе данных и связанный с ним аккаунт.
+    
+    Создает запись в таблице users и связанную запись в таблице accounts с нулевым балансом.
+    
+    Args:
+        firstname (str): Имя пользователя
+        username (str): Логин пользователя (unique)
+        password (str): Пароль пользователя (в открытом виде)
+    
+    Returns:
+        str: Идентификатор созданного пользователя
+    """
     db = await get_db()
     try:
         user_id = str(uuid.uuid4())
@@ -71,6 +112,15 @@ async def create_user(firstname, username, password):
 
 
 async def get_user_by_username(username):
+    """
+    Получает информацию о пользователе по логину.
+    
+    Args:
+        username (str): Логин пользователя
+    
+    Returns:
+        dict or None: Данные пользователя или None, если пользователь не найден
+    """
     db = await get_db()
     try:
         cur = await db.execute("SELECT * FROM users WHERE username = ?", (username,))
@@ -81,6 +131,15 @@ async def get_user_by_username(username):
 
 
 async def get_user_by_id(user_id):
+    """
+    Получает информацию о пользователе по идентификатору.
+    
+    Args:
+        user_id (str): Идентификатор пользователя
+    
+    Returns:
+        dict or None: Данные пользователя или None, если пользователь не найден
+    """
     db = await get_db()
     try:
         cur = await db.execute("SELECT * FROM users WHERE id = ?", (user_id,))
@@ -91,6 +150,15 @@ async def get_user_by_id(user_id):
 
 
 async def get_account_by_user_id(user_id):
+    """
+    Получает информацию об аккаунте пользователя по идентификатору пользователя.
+    
+    Args:
+        user_id (str): Идентификатор пользователя
+    
+    Returns:
+        dict or None: Данные аккаунта или None, если аккаунт не найден
+    """
     db = await get_db()
     try:
         cur = await db.execute("SELECT * FROM accounts WHERE user_id = ?", (user_id,))
@@ -101,6 +169,16 @@ async def get_account_by_user_id(user_id):
 
 
 async def add_balance(user_id, amount):
+    """
+    Увеличивает баланс пользователя на указанную сумму.
+    
+    Args:
+        user_id (str): Идентификатор пользователя
+        amount (float): Сумма, на которую увеличивается баланс
+    
+    Returns:
+        None
+    """
     db = await get_db()
     try:
         await db.execute("UPDATE accounts SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
@@ -110,6 +188,20 @@ async def add_balance(user_id, amount):
 
 
 async def subtract_balance(user_id, amount):
+    """
+    Уменьшает баланс пользователя на указанную сумму.
+    
+    Args:
+        user_id (str): Идентификатор пользователя
+        amount (float): Сумма, на которую уменьшается баланс
+    
+    Returns:
+        None
+    
+    Note:
+        Функция не проверяет достаточность средств на балансе, эту проверку необходимо 
+        выполнять перед вызовом функции.
+    """
     db = await get_db()
     try:
         await db.execute("UPDATE accounts SET balance = balance - ? WHERE user_id = ?", (amount, user_id))
@@ -119,6 +211,12 @@ async def subtract_balance(user_id, amount):
 
 
 async def get_models():
+    """
+    Получает список всех доступных моделей машинного обучения.
+    
+    Returns:
+        list: Список доступных моделей с их метаданными
+    """
     db = await get_db()
     try:
         cur = await db.execute("SELECT * FROM models")
@@ -129,6 +227,18 @@ async def get_models():
 
 
 async def create_model(name, cost, description, file_name):
+    """
+    Создает запись о новой модели в базе данных.
+    
+    Args:
+        name (str): Название модели
+        cost (float): Стоимость использования модели
+        description (str): Описание модели
+        file_name (str): Имя файла модели или ключ для доступа к модели (lr, rf, cb)
+    
+    Returns:
+        str: Идентификатор созданной модели
+    """
     db = await get_db()
     try:
         model_id = str(uuid.uuid4())
@@ -143,6 +253,15 @@ async def create_model(name, cost, description, file_name):
 
 
 async def get_model_by_id(model_id):
+    """
+    Получает информацию о модели по ее идентификатору.
+    
+    Args:
+        model_id (str): Идентификатор модели
+    
+    Returns:
+        dict or None: Данные модели или None, если модель не найдена
+    """
     db = await get_db()
     try:
         cur = await db.execute("SELECT * FROM models WHERE id = ?", (model_id,))
@@ -155,7 +274,19 @@ async def get_model_by_id(model_id):
 async def create_prediction(model_id: str, user_id: str, input_data: str, output_data: str, status: str):
     """
     Сохраняет запись предсказания в БД.
+    
+    Создает новую запись о предсказании с входными данными, результатами и указанным статусом.
     Ожидает получить input_data и output_data как готовые JSON строки.
+    
+    Args:
+        model_id (str): Идентификатор модели, используемой для предсказания
+        user_id (str): Идентификатор пользователя, создающего предсказание
+        input_data (str): Входные данные для предсказания в формате JSON-строки
+        output_data (str): Результаты предсказания в формате JSON-строки (может быть пустым для 'pending')
+        status (str): Статус предсказания ('pending', 'completed', 'failed')
+    
+    Returns:
+        str: Идентификатор созданного предсказания
     """
     db = await get_db()
     try:
@@ -178,6 +309,15 @@ async def create_prediction(model_id: str, user_id: str, input_data: str, output
 
 
 async def get_prediction_by_id(prediction_id):
+    """
+    Получает информацию о предсказании по его идентификатору.
+    
+    Args:
+        prediction_id (str): Идентификатор предсказания
+    
+    Returns:
+        dict or None: Данные предсказания или None, если предсказание не найдено
+    """
     db = await get_db()
     try:
         cur = await db.execute("SELECT * FROM predictions WHERE id = ?", (prediction_id,))
@@ -188,6 +328,15 @@ async def get_prediction_by_id(prediction_id):
 
 
 async def get_predictions_by_user(user_id):
+    """
+    Получает список всех предсказаний, созданных пользователем.
+    
+    Args:
+        user_id (str): Идентификатор пользователя
+    
+    Returns:
+        list: Список предсказаний пользователя
+    """
     db = await get_db()
     try:
         cur = await db.execute("SELECT * FROM predictions WHERE user_id = ?", (user_id,))

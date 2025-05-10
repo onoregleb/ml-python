@@ -1,3 +1,17 @@
+"""
+Основной файл FastAPI приложения для ML сервиса.
+
+Данный модуль реализует RESTful API для ML сервиса, который позволяет:
+1. Создавать пользователей и аккаунты
+2. Управлять балансом пользователей
+3. Получать доступные ML модели
+4. Создавать и получать предсказания
+5. Экспортировать результаты предсказаний
+
+Сервис использует базовую HTTP аутентификацию, загружает предобученные модели машинного обучения
+и выполняет обработку предсказаний в фоновом режиме.
+"""
+
 from fastapi import FastAPI, HTTPException, Depends, status, Body, BackgroundTasks
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
@@ -23,6 +37,23 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """
+    Функция жизненного цикла приложения FastAPI, которая выполняется при запуске и завершении.
+    
+    Выполняет следующие задачи:
+    1. Инициализирует базу данных
+    2. Загружает модели машинного обучения из файлов
+    3. Инициализирует метаданные моделей в БД, если они отсутствуют
+    
+    Args:
+        app (FastAPI): Экземпляр приложения FastAPI
+    
+    Yields:
+        None: Контрольная точка исполнения приложения
+    
+    Raises:
+        Exception: Если возникла ошибка при загрузке моделей
+    """
     logger.info("Starting up...")
     await init_db()
     # Загружаем модели из файлов
@@ -59,7 +90,19 @@ app = FastAPI(lifespan=lifespan)
 
 # Функция для обработки предсказаний в фоновом режиме
 def process_prediction_task(prediction_id, model_key, input_data_list):
-    """Обрабатывает предсказание в фоновом режиме с задержкой."""
+    """
+    Обрабатывает предсказание в фоновом режиме с искусственной задержкой.
+    
+    Функция предназначена для обработки предсказаний в фоновом режиме, что позволяет
+    клиентам не ждать завершения процесса. Добавляет случайную задержку, чтобы
+    симулировать длительную обработку, затем выполняет предсказание с выбранной
+    моделью и обновляет статус и результаты в базе данных.
+    
+    Args:
+        prediction_id (str): Идентификатор предсказания в БД
+        model_key (str): Ключ модели в словаре LOADED_MODELS
+        input_data_list (list): Список словарей с входными данными для предсказания
+    """
     logger.info(f"Starting background task for prediction {prediction_id} with model {model_key}")
     
     try:
@@ -135,6 +178,21 @@ def process_prediction_task(prediction_id, model_key, input_data_list):
         ))
 
 async def get_current_user(credentials: HTTPBasicCredentials = Depends(security)):
+    """
+    Получает информацию о текущем пользователе на основе переданных учетных данных.
+    
+    Валидирует логин и пароль, проверяет существование пользователя в базе данных.
+    Эта функция используется в зависимостях FastAPI для защиты эндпоинтов, требующих аутентификации.
+    
+    Args:
+        credentials (HTTPBasicCredentials): Объект с учетными данными пользователя (логин и пароль)
+    
+    Returns:
+        dict: Информация о пользователе из базы данных
+    
+    Raises:
+        HTTPException: Если учетные данные недействительны или пользователь не найден
+    """
     user = await get_user_by_username(credentials.username)
     if not user or user["password"] != credentials.password:
         raise HTTPException(
@@ -145,8 +203,22 @@ async def get_current_user(credentials: HTTPBasicCredentials = Depends(security)
     return user
 
 
-@app.post("/users")
+@app.post("/users", status_code=status.HTTP_201_CREATED)
 async def create_user_endpoint(user_data: CreateAccountDto):
+    """
+    Эндпоинт для создания нового пользователя и счета.
+    
+    Создает новую запись пользователя и связанный с ним счет с нулевым балансом.
+    
+    Args:
+        user_data (CreateAccountDto): Данные нового пользователя (имя, логин, пароль)
+    
+    Returns:
+        dict: Информация о созданном пользователе
+    
+    Raises:
+        HTTPException: Если пользователь с таким логином уже существует
+    """
     existing = await get_user_by_username(user_data.username)
     if existing:
         raise HTTPException(status_code=400, detail="Username already exists")
@@ -156,6 +228,17 @@ async def create_user_endpoint(user_data: CreateAccountDto):
 
 @app.get("/users/me")
 async def get_current_user_info(user = Depends(get_current_user)):
+    """
+    Эндпоинт для получения информации о текущем пользователе.
+    
+    Возвращает полную информацию о текущем пользователе, включая баланс счета.
+    
+    Args:
+        user (dict): Информация о пользователе из зависимости get_current_user
+    
+    Returns:
+        dict: Информация о пользователе, дополненная данными аккаунта
+    """
     account = await get_account_by_user_id(user["id"])
     return {
         "user_id": user["id"],
@@ -167,6 +250,14 @@ async def get_current_user_info(user = Depends(get_current_user)):
 
 @app.get("/models")
 async def get_models_endpoint():
+    """
+    Эндпоинт для получения списка доступных моделей машинного обучения.
+    
+    Возвращает все доступные модели с информацией о стоимости и описанием.
+    
+    Returns:
+        list: Список моделей с метаданными
+    """
     models = await get_models()
     logger.info(f"GET /models: returning {len(models)} models")
     return [{
@@ -177,12 +268,30 @@ async def get_models_endpoint():
     } for m in models]
 
 
-@app.post("/predict")
+@app.post("/predict", status_code=status.HTTP_201_CREATED)
 async def create_prediction_endpoint(
     background_tasks: BackgroundTasks,
     prediction_data: CreatePredictionDto = Body(...),
     user = Depends(get_current_user)
 ):
+    """
+    Эндпоинт для создания нового предсказания.
+    
+    Принимает данные для предсказания, проверяет баланс пользователя,
+    создает запись о предсказании в статусе 'pending' и запускает
+    асинхронную задачу для обработки предсказания в фоновом режиме.
+    
+    Args:
+        background_tasks (BackgroundTasks): Объект для добавления фоновых задач FastAPI
+        prediction_data (CreatePredictionDto): Данные для предсказания
+        user (dict): Информация о текущем пользователе
+    
+    Returns:
+        dict: Информация о созданном предсказании
+    
+    Raises:
+        HTTPException: Если модель не найдена, недостаточно средств на счете или неверный формат данных
+    """
     logger.info(f"Received prediction request for model_id: {prediction_data.model_id} from user {user['id']}")
     # Логируем тип и часть данных для отладки
     if isinstance(prediction_data.input_data, list):
@@ -297,6 +406,23 @@ async def create_prediction_endpoint(
 
 @app.get("/predict/{prediction_id}")
 async def get_prediction_endpoint(prediction_id: str, user = Depends(get_current_user)):
+    """
+    Эндпоинт для получения информации о конкретном предсказании.
+    
+    Возвращает детальную информацию о предсказании, включая входные данные,
+    результаты и статус. Для завершенных предсказаний также предоставляет
+    ссылку для скачивания результатов в CSV формате.
+    
+    Args:
+        prediction_id (str): Идентификатор предсказания
+        user (dict): Информация о текущем пользователе
+    
+    Returns:
+        dict: Детальная информация о предсказании
+    
+    Raises:
+        HTTPException: Если предсказание не найдено или пользователь не имеет прав на его просмотр
+    """
     logger.info(f"GET /predict/{prediction_id} requested by user {user['id']}")
     prediction = await get_prediction_by_id(prediction_id)
     if not prediction:
@@ -341,6 +467,23 @@ async def get_prediction_endpoint(prediction_id: str, user = Depends(get_current
 
 @app.get("/predict/{prediction_id}/download")
 async def download_prediction_csv(prediction_id: str, user = Depends(get_current_user)):
+    """
+    Эндпоинт для скачивания результатов предсказания в формате CSV.
+    
+    Проверяет права доступа, статус предсказания и наличие CSV данных,
+    затем создает ответ для скачивания файла.
+    
+    Args:
+        prediction_id (str): Идентификатор предсказания
+        user (dict): Информация о текущем пользователе
+    
+    Returns:
+        StreamingResponse: Ответ с CSV файлом для скачивания
+    
+    Raises:
+        HTTPException: Если предсказание не найдено, не завершено, пользователь
+                      не имеет прав доступа, или CSV данные недоступны
+    """
     logger.info(f"Download CSV for prediction {prediction_id} requested by user {user['id']}")
     prediction = await get_prediction_by_id(prediction_id)
     
@@ -364,11 +507,32 @@ async def download_prediction_csv(prediction_id: str, user = Depends(get_current
 
 
 class TopUpDto(BaseModel):
+    """
+    Модель данных для операции пополнения баланса.
+    
+    Attributes:
+        amount (float): Сумма пополнения, должна быть положительной
+    """
     amount: float
 
 
 @app.post("/account/topup")
 async def topup_account(data: TopUpDto, user = Depends(get_current_user)):
+    """
+    Эндпоинт для пополнения баланса пользователя.
+    
+    Добавляет указанную сумму к текущему балансу пользователя.
+    
+    Args:
+        data (TopUpDto): Данные о сумме пополнения
+        user (dict): Информация о текущем пользователе
+    
+    Returns:
+        dict: Сообщение об успешном пополнении и новый баланс
+    
+    Raises:
+        HTTPException: Если сумма пополнения не положительная
+    """
     amount = data.amount
     if amount <= 0:
         raise HTTPException(status_code=400, detail="Amount must be positive")
@@ -379,6 +543,18 @@ async def topup_account(data: TopUpDto, user = Depends(get_current_user)):
 
 @app.get("/predictions")
 async def get_user_predictions_endpoint(user = Depends(get_current_user)):
+    """
+    Эндпоинт для получения списка всех предсказаний пользователя.
+    
+    Возвращает краткую информацию о всех предсказаниях, созданных текущим пользователем.
+    
+    Args:
+        user (dict): Информация о текущем пользователе
+    
+    Returns:
+        list: Список предсказаний пользователя с базовой информацией
+    """
+
     predictions = await get_predictions_by_user(user["id"])
     return [{
         "id": p["id"],
