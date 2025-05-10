@@ -23,6 +23,8 @@ if 'prediction_status_check' not in st.session_state:
     st.session_state.prediction_status_check = {}
 if 'last_status_check_time' not in st.session_state:
     st.session_state.last_status_check_time = datetime.now()
+if 'auto_refresh_enabled' not in st.session_state:
+    st.session_state.auto_refresh_enabled = False
 # Auto-refresh was removed due to reliability issues
 
 # --- Вспомогательная функция ---
@@ -167,9 +169,7 @@ def check_pending_predictions(auth):
         if actual_status != previous_status:
             status_changed = True
     
-    # Отображаем информацию о pending предсказаниях с актуальным счетчиком
-    if actual_pending_count > 0:
-        st.info(f"You have {actual_pending_count} pending prediction(s). Use 'Refresh Predictions' to check for updates.")
+    # Не отображаем информацию о pending предсказаниях здесь, показываем только в разделе истории предсказаний
     
     return actual_pending_count, status_changed
 
@@ -296,12 +296,8 @@ def dashboard_page():
              st.write(f"Your balance: Invalid format ({st.session_state.user['balance']})")
 
     with col2:
-        # Добавляем кнопку обновления предсказаний
-        if st.button("Refresh Predictions"):
-            pending_count, status_changed = check_pending_predictions(auth)
-            if status_changed:
-                st.success("Status updated!")
-                st.rerun()
+        # Пустая колонка для расположения элементов
+        pass
     
     with col3:
         if st.button("Logout"):
@@ -584,10 +580,10 @@ def dashboard_page():
             # Проверяем наличие предсказаний в статусе pending
             pending_count = sum(1 for p in sorted_predictions if p.get('status') == 'pending')
             if pending_count > 0:
-                st.info(f"You have {pending_count} pending prediction(s). {'Auto-refreshing is enabled.' if st.session_state.auto_refresh_enabled else 'Enable auto-refresh for automatic updates.'}")
+                st.info(f"You have {pending_count} pending prediction(s).")
             
             # Добавляем кнопку для ручного обновления
-            if st.button("Refresh Predictions"):
+            if st.button("Refresh Predictions", key="refresh_predictions_btn"):
                 st.session_state.last_status_check_time = datetime.now() - timedelta(seconds=11)  # Форсируем проверку
                 st.rerun()
             
